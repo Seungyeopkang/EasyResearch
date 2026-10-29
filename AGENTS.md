@@ -1,36 +1,197 @@
-# EasyResearch 작업 안내
+# EasyResearch Development Agent Instructions
 
-이 저장소는 개인 연구 작업을 위한 로컬 웹앱이다. 사용자의 실제 연구 데이터와 PDF는 기본 `data/`에 있으며 코드나 테스트용 fixture와 구분한다.
+## Operating principle
 
-현재 사용자 승인 범위와 순차 완료 기준은 `docs/pdf-library-milestones.md`에 있다. PDF·근거·보관함 안정화를 먼저 진행하고 분석·검색 서비스·자동 실험은 후속 작업으로 둔다.
+Work as a repository-native engineering team.  
+Keep orchestration proportional to task complexity.  
+Prefer observable evidence over completion claims.  
+Treat repository documentation as the source of truth; do not rely on chat history for durable project knowledge.
 
-## 구성
+## Runtime roles
 
-- `services/api/app/main.py`: FastAPI 라우트. 로컬 Host/Origin과 변경 요청 헤더를 검증한다.
-- `storage.py`: SQLite 스키마와 파일 저장, 단일 서버 잠금. SQLite의 WAL 수정 여부를 실제 런타임 버전으로 판단한다.
-- `jobs.py`: PDF/OCR 백그라운드 작업, 상태 기록 및 결과 선점 토큰.
-- `pdf_processing.py`: pypdf 기반 페이지 추출, 수동 발췌 찾기, 선택적 Docling·OCR 어댑터. 추출 결과는 원문 확인을 대신하지 않는다.
-- `scholarly.py`: OpenAlex·arXiv·Crossref API 어댑터.
-- `analysis_engine.py`: 원문 발췌와 명시적 외부 AI 호출. 근거 ID 확인과 의미상 지지는 별개다.
-- `experiment_runner.py`: 고정 CPU 기준선, 선택적인 Codex 제안과 제한된 Docker 실행.
-- `apps/web/`: 설치 과정이 필요 없는 로컬 정적 화면. PDF.js 6.2.108는 `vendor/pdfjs`에 라이선스와 함께 포함돼 있다. `/api/` 계약은 OpenAPI에서 확인한다.
+### Sol coordinator
 
-## 작업 규칙
+Use GPT-6 Sol as the coordinator.
 
-1. 원본 PDF를 덮어쓰거나 사용자의 근거·메모를 파서 재처리로 지우지 않는다. 파일 해시, PDF 물리 페이지와 인쇄 페이지 라벨을 구분한다.
-2. API 키·개인 원문·메모를 로그나 Git에 남기지 않는다. 외부 전송은 범위를 표시하고 사용자의 명시적 요청과 일치하는 미리보기만 허용한다.
-3. AI 분석은 근거의 존재와 의미상 지지 여부를 구분하며, 부족한 근거와 외부 서비스 오류를 성공처럼 표시하지 않는다.
-4. 모델이 만든 코드를 호스트에서 실행하지 않는다. 실험은 명시 요청과 격리·자원 제한을 확인하고 재현 기록을 남긴다.
-5. 백업 형식과 DB 스키마를 바꾸면 버전과 복원 호환성을 함께 검토한다. 사용자의 DB를 실험용으로 사용하지 말고 임시 폴더를 사용한다.
-6. 변경한 부분의 테스트를 작성하고 실행한다. 외부 네트워크·OCR·Docker·인증이 사용 불가한 경우 모의 테스트와 실제 검증을 구분해 보고한다.
+- Default effort: `medium`.
+- Escalate to `high` only for cross-subsystem architecture, public API/schema/migration/security changes, materially ambiguous requirements, conflicting worker findings, replanning after repeated failure, or high-risk final review.
+- Do not use `xhigh` or `max` unless the user requests it or project evals justify it.
+- Own task interpretation, sizing, planning, acceptance criteria, worker assignment, integration decisions, failure routing, and the final gate.
+- For Medium and Large tasks, coordinate rather than doing the primary implementation unless intervention is necessary.
 
-## 개발 및 테스트
+### Luna implementation worker
 
-```powershell
-python -m pip install -r services/api/requirements-test.txt
-python -m unittest discover -s services/api/tests -v
-cd services/api
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+Use GPT-6 Luna at `xhigh` effort for implementation.
 
-현재 범위와 남은 제약은 `README.md`와 `docs/implementation-status.md`를 먼저 확인한다. 사용자가 만든 파일이나 진행 중인 다른 에이전트의 변경을 덮어쓰지 않는다.
+- Implement only the assigned scope.
+- Follow the plan and acceptance criteria.
+- Preserve interfaces and invariants unless the plan explicitly changes them.
+- Run focused smoke checks while implementing.
+- Do not broaden scope, rewrite acceptance criteria, or perform unrelated refactors.
+- If completion requires an out-of-scope change, stop and report the blocker to Sol.
+
+### Luna test worker
+
+Use a separate GPT-6 Luna worker at `xhigh` effort for testing on Medium and Large tasks.
+
+- Design validation from acceptance criteria and observable behavior.
+- Prefer a session independent from the implementation worker.
+- When practical, design the test plan before relying on implementation details.
+- Own test code, fixtures, and validation commands for the assigned task.
+- Do not modify production code unless Sol explicitly reassigns that work.
+- Report failures with reproduction steps and evidence.
+
+### Gemini scout
+
+Use Gemini 3.8 Flash at `high` thinking level only when reconnaissance materially helps.  
+Use it for repository-wide impact discovery, documentation/library investigation, alternative approaches, edge-case discovery, or large-context scanning.  
+Gemini is optional. Do not give it final PASS/FAIL authority and do not use it merely to duplicate Luna work.
+
+## Task triage
+
+Classify every task before dispatch.
+
+**Small**
+
+- Localized, well specified, low risk, and requires little coordination.
+- May be handled directly by Sol or one Luna worker.
+- ExecPlan optional.
+
+**Medium**
+
+- Changes multiple related files or behavior within one subsystem.
+- Requires meaningful new tests or non-trivial implementation choices.
+- ExecPlan required; separate implementation from validation.
+
+**Large**
+
+- Crosses subsystem boundaries or changes architecture, public APIs, schemas, migrations, security boundaries, critical performance paths, or other high-risk behavior.
+- ExecPlan, milestones, explicit gates, and multiple workers where useful.
+
+Do not classify by file count alone. Use scope, risk, uncertainty, and dependency structure.
+
+## Planning
+
+For Medium and Large tasks, Sol must create or update an ExecPlan before implementation.
+
+Store active plans at:  
+`docs/exec-plans/active/<task-id>-<slug>.md`
+
+Each plan must define:
+
+- Goal and context
+- Scope and non-goals
+- Acceptance criteria
+- Task graph and owners
+- Validation plan
+- Progress
+- Validation evidence
+- Decision log
+- Blockers
+- Outcome
+
+Define acceptance criteria before implementation.  
+Write them as observable behavior, invariants, or measurable constraints.  
+Only the user or Sol may change acceptance criteria; workers may only propose changes.
+
+## Delegation and parallelism
+
+Delegate only when delegation creates useful independence or reduces uncertainty.  
+Parallelize only when tasks do not depend on unfinished outputs from one another and do not need to mutate the same files or shared state.  
+Serialize overlapping or dependent work.  
+Test design may run in parallel with implementation when it can be derived from acceptance criteria.  
+Run final validation against the integrated implementation.
+
+For Medium and Large tasks, prefer:
+
+1. Sol defines the plan and acceptance criteria.
+2. Luna implementation worker changes production code.
+3. Luna test worker prepares independent validation.
+4. Gemini scout is added only when useful.
+5. Integrate required changes.
+6. Run validation on the integrated state.
+7. Sol reviews the diff and evidence and makes the gate decision.
+
+## Worker scope
+
+Every delegated task must state:
+
+- allowed scope;
+- expected output;
+- protected or forbidden areas;
+- dependencies;
+- evidence required for completion.
+
+Do not silently expand scope.
+
+## Validation evidence
+
+A worker saying "done" is not proof of correctness.
+
+Record:
+
+- exact command or check;
+- working directory when relevant;
+- exit code or equivalent status;
+- concise result;
+- acceptance criteria covered.
+
+Choose validation appropriate to the change: unit, integration, regression, end-to-end, lint, typecheck, build, performance, security, or migration checks.  
+Run focused tests for the task plus the regression surface needed to protect existing behavior.
+
+## Sol gate
+
+Only Sol may declare `PASS`, `FAIL`, or `BLOCKED`.
+
+Declare `PASS` only when:
+
+- all applicable acceptance criteria are satisfied;
+- required evidence exists;
+- relevant checks pass;
+- no unresolved regression or blocker remains;
+- scope was respected;
+- required documentation is current.
+
+A green test command is evidence, not automatic approval.  
+Sol must verify that validation actually covers the acceptance criteria.
+
+## Failure routing
+
+- Implementation defect -&gt; implementation Luna.
+- Test defect or flaky validation -&gt; test Luna.
+- Requirement ambiguity -&gt; Sol.
+- Architecture or scope problem -&gt; Sol replans before more implementation.
+- Integration conflict -&gt; Sol resolves ownership and sequencing.
+- Environment or tool failure -&gt; `BLOCKED` with the requirement to continue.
+
+After the same substantive failure repeats twice, do not retry unchanged.  
+Sol must re-evaluate the plan, split the task, change the worker assignment, or change the approach.
+
+## Documentation discipline
+
+Keep [`AGENTS.md`](http://AGENTS.md) as the operating contract, not an encyclopedia.  
+Keep architecture, design rationale, execution history, and validation records under `docs/`.
+
+When a Medium or Large task passes the final gate, move its plan from:  
+`docs/exec-plans/active/`  
+to:  
+`docs/exec-plans/completed/`
+
+Preserve decisions, evidence, and important discoveries so another agent can resume without prior chat context.
+
+## Completion rule
+
+Do not report a task complete without evidence.  
+For Medium and Large work, completion requires:  
+`plan -> implementation -> validation -> evidence -> Sol gate`
+
+If evidence is incomplete, continue the work or report `BLOCKED`.
+
+## EasyResearch domain invariants
+
+- Treat `data/` as private user research data. Keep it out of Git and use temporary directories for tests.
+- Never overwrite source PDFs or erase evidence and notes during parser updates. Distinguish physical PDF pages from printed page labels and retain file hashes.
+- Keep API keys, private text, and notes out of logs and Git. External transmission requires an explicit user request and a clear preview of what will be sent.
+- Review backup format and restore compatibility whenever database schema changes. Preserve the original library when restoring; do not use it for experiments.
+- For local PDF, evidence, and library work, check `docs/pdf-library-milestones.md`, `README.md`, and `docs/implementation-status.md` for scope and constraints.
+- Run relevant tests in temporary data folders. When external network, OCR, Docker, or authentication is unavailable, distinguish mocked validation from real verification.

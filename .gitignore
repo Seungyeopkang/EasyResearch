@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
 .venv/
 node_modules/
@@ -9,3 +10,8 @@ data/
 .env
 *.sqlite3-wal
 *.sqlite3-shm
+.coverage
+htmlcov/
+*.log
+.DS_Store
+Thumbs.db
