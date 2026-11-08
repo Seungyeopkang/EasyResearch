@@ -154,7 +154,7 @@ class VersionMigrationTests(unittest.TestCase):
             self.assertEqual((root/key).read_bytes(),raw)
             storage.init_db()
             with closing(sqlite3.connect(str(database))) as con:
-                self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],5)
+                self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],storage.SCHEMA_VERSION)
                 self.assertEqual(con.execute('SELECT label FROM paper_versions').fetchone()[0],'old')
                 self.assertEqual(con.execute('SELECT count(*) FROM paper_version_trash').fetchone()[0],0)
             self.assertEqual((root/key).read_bytes(),raw)

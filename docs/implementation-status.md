@@ -14,6 +14,8 @@
 
 - 2026-11-08: 휴지통 영구 삭제(영향 미리보기·확인 토큰), 백업 손상 재현 테스트, BBT 방식 citekey, CSL-JSON·W3C 주석 JSON-LD·Obsidian 노트 내보내기, Obsidian 볼트 동기화 스크립트(`scripts/sync_obsidian.py`), 읽기 전용 MCP 서버(`services/mcp/`), 딥링크와 키보드 단축키를 추가했다. 세부 기록은 [ExecPlan 002](exec-plans/completed/002-library-completion-and-integrations.md)에 있다. MCP 서버는 실제 MCP 클라이언트와의 stdio 연결을 확인하지 않았고, `mcp` 패키지는 앱과 다른 `starlette` 버전을 요구해 별도 가상환경이 필요하다.
 
+- 2026-11-08: 프로젝트와 분리된 서재(스키마 v6, 논문별 읽기 상태), 연속 스크롤 뷰어, 브라우저 내장 번역(사용자 Chrome 157에서 확인), 분야 자동 분류(키워드 규칙과 OpenAlex 주제), 프로젝트 없는 검색과 공개 PDF 받기, 화면 디자인 개편을 추가했다. 세부 기록은 [ExecPlan 003](exec-plans/completed/003-reading-library-and-design.md)에 있다.
+
 ## 현재 동작
 
 - 단일 사용자 로컬 웹앱: 프로젝트 생성, PDF 등록·해시 기반 중복 처리, PDF 없는 검색 논문에 PDF 연결, 읽기 상태·마지막 앱 페이지 기록.

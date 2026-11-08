@@ -1,4 +1,5 @@
 """Database version guard tests use isolated, disposable SQLite files."""
+import json
 import os
 import sqlite3
 from contextlib import closing
@@ -214,6 +215,80 @@ class SchemaVersionGuardTests(unittest.TestCase):
         self.assertEqual(wal.read_bytes(), original_wal)
         self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 9)
         self.assertEqual(con.execute("SELECT content FROM future_records").fetchone()[0], "in wal")
+
+
+class V6MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        env = patch.dict(os.environ, {"EASYRESEARCH_DATA_DIR": self.temporary.name})
+        env.start()
+        self.addCleanup(env.stop)
+        self.database = Path(self.temporary.name) / "library.sqlite3"
+
+    def make_v5(self):
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            con.executescript(storage.SCHEMA_V5)
+            con.execute("PRAGMA user_version=5")
+            con.executemany("INSERT INTO projects(id,name) VALUES(?,?)", [("a", "Project A"), ("b", "Project B")])
+            con.executemany("INSERT INTO papers(id,title) VALUES(?,?)", [(f"p{i}", f"Paper {i}") for i in range(1, 5)] + [("p5", "Unlinked")])
+            con.executemany("INSERT INTO project_papers(project_id,paper_id,reading_status,last_page) VALUES(?,?,?,?)", [
+                ("a", "p1", "read", 3), ("b", "p1", "to_read", 9),
+                ("a", "p2", "on_hold", 1), ("b", "p2", "reading", 4),
+                ("a", "p3", "to_read", 0), ("b", "p3", "on_hold", 0),
+                ("a", "p4", "to_read", 2),
+            ])
+
+    def test_v5_to_v6_aggregates_status_and_seeds_categories_without_touching_links(self):
+        self.make_v5()
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            links_before = con.execute("SELECT project_id,paper_id,reading_status,last_page FROM project_papers ORDER BY 1,2").fetchall()
+        storage.init_db()
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
+            states = {row[0]: (row[1], row[2]) for row in con.execute("SELECT paper_id,reading_status,last_page FROM paper_reading_state")}
+            self.assertEqual(states, {"p1": ("read", 9), "p2": ("reading", 4), "p3": ("on_hold", 0),
+                                      "p4": ("to_read", 2), "p5": ("to_read", 0)})
+            self.assertEqual(con.execute("SELECT project_id,paper_id,reading_status,last_page FROM project_papers ORDER BY 1,2").fetchall(), links_before)
+            categories = {row[0]: row[1] for row in con.execute("SELECT name,keywords_json FROM categories")}
+            self.assertEqual(sorted(categories), sorted(["최적화", "경량화", "컴퓨터 비전", "자연어 처리", "생성 모델", "강화학습"]))
+            self.assertIn("adam", json.loads(categories["최적화"]))
+            self.assertIn("pruning", json.loads(categories["경량화"]))
+            self.assertEqual(con.execute("SELECT count(*) FROM paper_categories").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT count(*) FROM paper_topics").fetchone()[0], 0)
+            self.assertEqual(len({row[0] for row in con.execute("SELECT id FROM categories")}), 6)
+        snapshots = list((Path(self.temporary.name) / "migration-backups").glob("*.sqlite3"))
+        self.assertEqual(len(snapshots), 1)
+        with closing(sqlite3.connect(str(snapshots[0]))) as con, con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIsNone(con.execute("SELECT name FROM sqlite_master WHERE name='paper_reading_state'").fetchone())
+        # A later launch does not migrate again and does not duplicate the defaults.
+        storage.init_db()
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            self.assertEqual(con.execute("SELECT count(*) FROM categories").fetchone()[0], 6)
+            self.assertEqual(con.execute("SELECT count(*) FROM paper_reading_state").fetchone()[0], 5)
+
+    def test_fresh_database_gets_only_default_categories(self):
+        storage.init_db()
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
+            self.assertEqual(con.execute("SELECT count(*) FROM categories").fetchone()[0], 6)
+            self.assertEqual(con.execute("SELECT count(*) FROM paper_reading_state").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT count(*) FROM paper_categories").fetchone()[0], 0)
+            self.assertEqual(con.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_v6_migration_failure_leaves_v5_library_untouched(self):
+        self.make_v5()
+        def fail(con):
+            storage._execute_schema(con, storage.SCHEMA_V6_ADDITIONS)
+            con.execute("INSERT INTO paper_reading_state(paper_id,reading_status,last_page) SELECT id,'read',9 FROM papers")
+            raise RuntimeError("v6 failure")
+        with patch.dict(storage.MIGRATIONS, {5: fail}):
+            with self.assertRaisesRegex(RuntimeError, "v6 failure"):
+                storage.init_db()
+        with closing(sqlite3.connect(str(self.database))) as con, con:
+            self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIsNone(con.execute("SELECT name FROM sqlite_master WHERE name='categories'").fetchone())
 
 
 if __name__ == "__main__":

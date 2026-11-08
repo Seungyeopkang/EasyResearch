@@ -494,6 +494,9 @@ def _paper_plan(con, paper):
         ('page_extraction_details', 'paper_id=?', (pid,)),
         ('pages', 'paper_id=?', (pid,)),
         ('ocr_pages', 'paper_id=?', (pid,)),
+        ('paper_categories', 'paper_id=?', (pid,)),
+        ('paper_topics', 'paper_id=?', (pid,)),
+        ('paper_reading_state', 'paper_id=?', (pid,)),
     ]
     if jobs:
         specs += [

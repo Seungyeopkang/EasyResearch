@@ -27,7 +27,7 @@ function harness({hash='',projectId='',papers={},dialogOpen=false,paper=null,ref
     syncProjects:()=>{calls.syncs++},
     refreshProjects:async()=>{calls.refreshes++;if(refreshed)state.projects=refreshed.map(p=>({...p}))},
     render:async()=>{calls.renders++;if(!state.paper)ctx.clearPaperHash();state.papers=papers[state.projectId]||[]},
-    openPaper:async(id,page)=>{calls.opened.push({id,page});state.paper={id};state.page=page??1;ctx.setPaperHash(id,state.projectId,state.page)},
+    openPaper:async(id,page)=>{calls.opened.push({id,page});state.paper={id};state.page=page??1;ctx.setPaperHash(id,state.page)},
   });
   vm.runInContext(hashHelpers+'\n'+deepLinks+'\nthis.openDeepLink=openDeepLink;this.clearPaperHash=clearPaperHash;this.setPaperHash=setPaperHash;this.readerKeyHandler=readerKeyHandler;',ctx);
   return {ctx,state,calls,location,listeners,windowListeners,nodes};
@@ -42,7 +42,7 @@ async function main(){
   assert.equal(h.state.projectId,'proj-b');assert.equal(h.calls.storage['easyresearch-project'],'proj-b');
   assert.equal(h.calls.syncs,1);assert.equal(h.state.view,'library');
   assert.deepEqual(h.calls.opened,[{id:'paper-1',page:3}]);
-  assert.equal(h.location.hash,'#/paper/paper-1?project=proj-b&page=3');
+  assert.equal(h.location.hash,'#/paper/paper-1?page=3');
   assert.equal(h.calls.notify.length,0);
   await flush();assert.equal(h.calls.opened.length,1);
 
@@ -65,21 +65,20 @@ async function main(){
   assert.equal(h.calls.refreshes,1);assert.equal(h.state.projectId,'proj-c');
   assert.deepEqual(h.calls.opened,[{id:'paper-3',page:2}]);assert.equal(h.calls.notify.length,0);
 
-  // A project still missing after the refresh shows a Korean error and opens nothing.
+  // The project parameter is optional: a link naming a missing project still opens the paper and keeps the current project.
   h=harness({hash:'#/paper/paper-1?project=nope',projectId:'proj-a',papers});
   await h.ctx.openDeepLink(h.location.hash);
-  assert.equal(h.calls.refreshes,1);
-  assert.match(h.calls.notify[0].message,/프로젝트를 찾을 수 없습니다/);
-  assert.deepEqual(h.calls.opened,[]);assert.equal(h.state.projectId,'proj-a');
+  assert.equal(h.calls.refreshes,1);assert.equal(h.calls.notify.length,0);
+  assert.deepEqual(h.calls.opened,[{id:'paper-1',page:null}]);assert.equal(h.state.projectId,'proj-a');
 
+  // A known project in the link is selected; the paper itself is opened by id.
   h=harness({hash:'#/paper/paper-9?project=proj-b',projectId:'proj-a',papers});
   await h.ctx.openDeepLink(h.location.hash);
-  assert.equal(h.state.projectId,'proj-b');assert.match(h.calls.notify[0].message,/해당 논문/);
-  assert.deepEqual(h.calls.opened,[]);
+  assert.equal(h.state.projectId,'proj-b');assert.deepEqual(h.calls.opened,[{id:'paper-9',page:null}]);
 
   h=harness({hash:'#/paper/paper-1',projectId:'proj-a',papers});
   await h.ctx.openDeepLink(h.location.hash);
-  assert.match(h.calls.notify[0].message,/프로젝트와 논문 정보/);assert.deepEqual(h.calls.opened,[]);
+  assert.equal(h.calls.notify.length,0);assert.deepEqual(h.calls.opened,[{id:'paper-1',page:null}]);assert.equal(h.state.projectId,'proj-a');
 
   // Other hashes are ignored entirely.
   h=harness({hash:'#/search',projectId:'proj-a',papers});
