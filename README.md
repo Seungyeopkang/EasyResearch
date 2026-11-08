@@ -27,11 +27,25 @@ PDF 없이 제목·저자·연도·DOI를 직접 입력해 먼저 보관할 수 
 
 백업 화면에서 ZIP 내용을 확인한 뒤 복원하면 기존 보관함을 덮어쓰지 않고 별도 폴더에 검증된 사본이 만들어집니다. 복원본을 사용하려면 현재 앱을 종료하고 프로젝트 폴더의 `복원 보관함 열기.cmd`를 실행한 뒤 목록에서 복원 번호를 선택합니다. 도구는 복원본의 데이터베이스와 PDF를 다시 검사합니다. 복원본에 새로 저장한 내용은 기존 보관함과 별도로 보존됩니다. 원래 보관함으로 돌아가려면 복원본 실행 창을 닫고 `EasyResearch 시작.cmd`를 실행하세요.
 
+## 노트 도구·에이전트 연결
+
+- **휴지통 영구 삭제:** 휴지통에서 `영구 삭제`를 누르면 함께 지워질 기록과 차단 사유를 먼저 보여줍니다. "삭제"를 입력해야 실행되며, 원본 PDF는 다른 논문이 쓰지 않고 직접 선택한 경우에만 지웁니다. 기존 백업 ZIP은 바뀌지 않습니다.
+- **내보내기:** 보관함 화면의 내보내기에서 Markdown·BibTeX·JSON 외에 CSL-JSON(Zotero 가져오기용), 주석 JSON-LD(W3C Web Annotation), Obsidian 노트 ZIP을 고를 수 있습니다. BibTeX와 CSL-JSON의 키는 Better BibTeX 기본 규칙(`첫저자성` + 제목 앞 세 단어 + 연도, 예: `heDeepResidualLearning2016`)을 따르며, 같은 키는 a, b, c 접미사로 구분합니다.
+- **딥링크:** `http://127.0.0.1:8000/#/paper/<논문ID>?project=<프로젝트ID>&page=<쪽>` 주소는 해당 프로젝트의 논문 페이지를 엽니다. Obsidian 노트의 링크가 이 형식입니다. 논문 화면에서 ←/→로 페이지를 넘기고 `?`로 단축키 목록을 엽니다.
+- **Obsidian 볼트 동기화:** 앱을 실행한 상태에서 다음을 실행합니다. 노트의 `<!-- easyresearch:begin -->`~`<!-- easyresearch:end -->` 구간만 갱신하고 그 밖의 내용과 frontmatter는 보존합니다. 표식이 없는 기존 파일은 바꾸지 않고 충돌로 알립니다. `--dry-run`으로 미리 확인할 수 있습니다.
+
+  ```powershell
+  python scripts/sync_obsidian.py --project <프로젝트ID> --vault "C:\경로\내 볼트"
+  ```
+
+- **에이전트(MCP) 연결:** `services/mcp/README.md`의 안내대로 별도 가상환경에 설치하면 Claude Code 등 MCP 클라이언트가 보관함을 읽기 전용으로 조회합니다. 쓰기 요청은 보내지 않으며 PDF 본문은 신뢰하지 않는 데이터로 표시됩니다.
+
 ## 테스트
 
 ```powershell
 python -m pip install -r services/api/requirements-test.txt
 python -m unittest discover -s services/api/tests -v
+python -m unittest discover -s tests -v
 ```
 
 합성 PDF와 모의 API 응답을 사용하는 자동 테스트입니다. 실제 논문 표본의 표·수식 정확도, OCR 품질과 외부 서비스 연결은 별도로 검증해야 합니다.

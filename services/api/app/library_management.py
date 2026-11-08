@@ -355,6 +355,8 @@ def add_paper_version(paper_id: str, file: UploadFile = File(...), label: str = 
         if not paper: raise HTTPException(409,'논문 상태가 바뀌었습니다. 다시 시도해 주세요.')
         old=con.execute('SELECT id FROM files WHERE sha256=?',(sha,)).fetchone()
         fid=old['id'] if old else storage.new_id()
+        if not storage.file_path(key).is_file():
+            raise HTTPException(409,'PDF를 저장하는 중 파일이 정리되었습니다. 다시 등록해 주세요.')
         if not old: con.execute('INSERT INTO files(id,sha256,size,storage_key) VALUES(?,?,?,?)',(fid,sha,size,key))
         if paper['file_id']==fid:
             return {'duplicate':True,'primary':True,'file_id':fid,'sha256':sha,'notice':'기존 원본과 같은 파일입니다.'}
@@ -432,3 +434,193 @@ def get_version_file(paper_id: str, version_id: str):
             for part in iter(lambda:source.read(1024*1024),b''): digest.update(part)
         if digest.hexdigest()!=row['sha256']: raise HTTPException(409,'PDF 파일이 변경되었거나 손상되었습니다. 백업을 확인해 주세요.')
         return FileResponse(path,media_type='application/pdf',filename='paper-version.pdf',content_disposition_type='inline')
+
+
+# ---- Permanent purge of items already in trash (AC-3) ----
+PURGE_NOTICE = '영구 삭제는 되돌릴 수 없습니다. 기존 백업 ZIP 파일은 변경되지 않습니다.'
+
+class PurgeConfirm(BaseModel):
+    confirm_token: str = Field(min_length=1, max_length=128)
+    delete_files: bool = False
+
+def _in(values):
+    return ','.join('?' * len(values)) if values else 'NULL'
+
+def _column(con, sql, params=()):
+    return sorted({row[0] for row in con.execute(sql, params).fetchall()}, key=str)
+
+def _evidence_specs(con, ev):
+    """Delete specs for evidence rows in FK-safe order: (table, where, params)."""
+    rev = _column(con, f'SELECT id FROM evidence_revisions WHERE evidence_id IN ({_in(ev)})', ev)
+    blocked = []
+    linked = _column(con, f'SELECT DISTINCT evidence_id FROM idea_evidence WHERE evidence_id IN ({_in(ev)})', ev)
+    if linked:
+        blocked.append({'reason': 'idea_linked_evidence', 'ids': linked})
+    specs = [
+        ('revision_provenance', f'revision_id IN ({_in(rev)})', rev),
+        ('revision_ocr_source', f'revision_id IN ({_in(rev)})', rev),
+        ('evidence_revisions', f'evidence_id IN ({_in(ev)})', ev),
+        ('evidence_provenance', f'evidence_id IN ({_in(ev)})', ev),
+        ('evidence_ocr_source', f'evidence_id IN ({_in(ev)})', ev),
+        ('evidence_trash', f'evidence_id IN ({_in(ev)})', ev),
+        ('evidence', f'id IN ({_in(ev)})', ev),
+    ]
+    return specs, blocked, rev
+
+def _finish_plan(con, kind, item_id, title, specs, blocked, deletable=(), retained=False):
+    counts = {}
+    for table, where, params in specs:
+        counts[table] = counts.get(table, 0) + con.execute(f'SELECT count(*) FROM {table} WHERE {where}', params).fetchone()[0]
+    return {'kind': kind, 'id': item_id, 'title': title, 'specs': specs,
+            'counts': dict(sorted(counts.items())), 'blocked_by': blocked,
+            'deletable': list(deletable),
+            'retained_files_reason': '다른 논문이나 버전이 같은 PDF를 사용하므로 원본 파일은 삭제하지 않습니다.' if retained else ''}
+
+def _paper_plan(con, paper):
+    pid = paper['id']
+    ev = _column(con, 'SELECT id FROM evidence WHERE paper_id=?', (pid,))
+    specs, blocked, rev = _evidence_specs(con, ev)
+    jobs = sorted(set(_column(con, 'SELECT id FROM jobs WHERE target_id=?', (pid,)))
+                  | set(_column(con, 'SELECT job_id FROM ocr_pages WHERE paper_id=?', (pid,))))
+    if jobs:
+        shared_page = _column(con, f'SELECT job_id FROM ocr_pages WHERE job_id IN ({_in(jobs)}) AND paper_id<>?', [*jobs, pid])
+        if shared_page:
+            blocked.append({'reason': 'ocr_job_shared', 'ids': shared_page})
+        outside = ([str(x) for x in _column(con, f'SELECT evidence_id FROM evidence_ocr_source WHERE job_id IN ({_in(jobs)})', jobs) if x not in set(ev)]
+                   + [str(x) for x in _column(con, f'SELECT revision_id FROM revision_ocr_source WHERE job_id IN ({_in(jobs)})', jobs) if x not in set(rev)])
+        if outside:
+            blocked.append({'reason': 'ocr_source_in_use', 'ids': sorted(outside)})
+    specs += [
+        ('page_extraction_details', 'paper_id=?', (pid,)),
+        ('pages', 'paper_id=?', (pid,)),
+        ('ocr_pages', 'paper_id=?', (pid,)),
+    ]
+    if jobs:
+        specs += [
+            ('job_events', f'job_id IN ({_in(jobs)})', jobs),
+            ('jobs', f'id IN ({_in(jobs)})', jobs),
+        ]
+    versions = _column(con, 'SELECT id FROM paper_versions WHERE paper_id=?', (pid,))
+    specs += [
+        ('project_papers', 'paper_id=?', (pid,)),
+        ('link_trash', 'paper_id=?', (pid,)),
+        ('project_paper_notes', 'paper_id=?', (pid,)),
+        ('paper_version_state', f'version_id IN ({_in(versions)})', versions),
+        ('paper_version_trash', f'version_id IN ({_in(versions)})', versions),
+        ('paper_versions', 'paper_id=?', (pid,)),
+        ('papers', 'id=?', (pid,)),
+    ]
+    # A PDF is deletable only when no other paper row or version row still uses it.
+    candidates = set(_column(con, 'SELECT file_id FROM paper_versions WHERE paper_id=?', (pid,)))
+    if paper['file_id']:
+        candidates.add(paper['file_id'])
+    deletable, retained = [], False
+    for fid in sorted(candidates):
+        users = con.execute('''SELECT (SELECT count(*) FROM papers WHERE file_id=? AND id<>?)
+            + (SELECT count(*) FROM paper_versions WHERE file_id=? AND paper_id<>?)''', (fid, pid, fid, pid)).fetchone()[0]
+        if users:
+            retained = True
+        else:
+            deletable.append(dict(con.execute('SELECT id,sha256,size,storage_key FROM files WHERE id=?', (fid,)).fetchone()))
+    return _finish_plan(con, 'papers', pid, paper['title'], specs, blocked, deletable, retained)
+
+def _project_plan(con, project):
+    pid = project['id']
+    ideas = _column(con, 'SELECT id FROM ideas WHERE project_id=?', (pid,))
+    specs = [
+        ('idea_evidence', f'idea_id IN ({_in(ideas)})', ideas),
+        ('ideas', 'project_id=?', (pid,)),
+        ('experiments', 'project_id=?', (pid,)),
+        ('search_runs', 'project_id=?', (pid,)),
+        ('project_papers', 'project_id=?', (pid,)),
+        ('link_trash', 'project_id=?', (pid,)),
+        ('project_paper_notes', 'project_id=?', (pid,)),
+        ('project_trash', 'project_id=?', (pid,)),
+        ('projects', 'id=?', (pid,)),
+    ]
+    return _finish_plan(con, 'projects', pid, project['name'], specs, [])
+
+def _evidence_plan(con, row):
+    specs, blocked, _ = _evidence_specs(con, [row['id']])
+    return _finish_plan(con, 'evidence', row['id'], row['title'], specs, blocked)
+
+def _link_plan(con, row):
+    specs = [('link_trash', 'id=?', (row['id'],))]
+    return _finish_plan(con, 'links', row['id'], row['title'], specs, [])
+
+def _purge_plan(con, kind, item_id):
+    if kind == 'papers':
+        paper = con.execute('SELECT id,title,file_id FROM papers WHERE id=? AND deleted_at IS NOT NULL', (item_id,)).fetchone()
+        if not paper: raise HTTPException(404, '휴지통에서 논문을 찾을 수 없습니다.')
+        return _paper_plan(con, paper)
+    if kind == 'projects':
+        row = con.execute('''SELECT p.id,p.name FROM projects p JOIN project_trash t ON t.project_id=p.id
+                             WHERE p.id=?''', (item_id,)).fetchone()
+        if not row: raise HTTPException(404, '휴지통에서 프로젝트를 찾을 수 없습니다.')
+        return _project_plan(con, row)
+    if kind == 'evidence':
+        row = con.execute('''SELECT e.id,p.title FROM evidence e JOIN evidence_trash t ON t.evidence_id=e.id
+                             JOIN papers p ON p.id=e.paper_id WHERE e.id=?''', (item_id,)).fetchone()
+        if not row: raise HTTPException(404, '휴지통에서 근거를 찾을 수 없습니다.')
+        return _evidence_plan(con, row)
+    if kind == 'links':
+        row = con.execute('''SELECT t.id,p.title FROM link_trash t JOIN papers p ON p.id=t.paper_id
+                             WHERE t.id=?''', (item_id,)).fetchone()
+        if not row: raise HTTPException(404, '휴지통에서 연결을 찾을 수 없습니다.')
+        return _link_plan(con, row)
+    raise HTTPException(404, '알 수 없는 휴지통 항목입니다.')
+
+def _preview_body(plan):
+    files = [{'file_id': f['id'], 'sha256': f['sha256'], 'size': f['size']} for f in plan['deletable']]
+    basis = {'kind': plan['kind'], 'id': plan['id'], 'counts': plan['counts'],
+             'blocked_by': plan['blocked_by'], 'deletable_files': files}
+    token = hashlib.sha256(json.dumps(basis, sort_keys=True, ensure_ascii=False,
+                                      separators=(',', ':')).encode('utf-8')).hexdigest()
+    return {'kind': plan['kind'], 'id': plan['id'], 'title': plan['title'], 'counts': plan['counts'],
+            'blocked_by': plan['blocked_by'], 'deletable_files': files,
+            'retained_files_reason': plan['retained_files_reason'],
+            'confirm_token': token, 'notice': PURGE_NOTICE}
+
+@router.get('/api/trash/{kind}/{item_id}/purge-preview')
+def purge_preview(kind: str, item_id: str):
+    with storage.transaction() as con:
+        con.execute('BEGIN')
+        return _preview_body(_purge_plan(con, kind, item_id))
+
+@router.post('/api/trash/{kind}/{item_id}/purge')
+def purge_trash_item(kind: str, item_id: str, payload: PurgeConfirm):
+    with storage.transaction() as con:
+        con.execute('BEGIN IMMEDIATE')
+        plan = _purge_plan(con, kind, item_id)
+        body = _preview_body(plan)
+        if payload.confirm_token != body['confirm_token']:
+            raise HTTPException(409, '휴지통 항목이 바뀌었습니다. 미리보기를 다시 확인해 주세요.')
+        if plan['blocked_by']:
+            raise HTTPException(409, '차단 사유가 있어 영구 삭제할 수 없습니다. 미리보기의 차단 사유를 확인해 주세요.')
+        for table, where, params in plan['specs']:
+            con.execute(f'DELETE FROM {table} WHERE {where}', params)
+        if payload.delete_files and plan['deletable']:
+            ids = [f['id'] for f in plan['deletable']]
+            con.execute(f'DELETE FROM files WHERE id IN ({_in(ids)})', ids)
+    # The database change is committed; only now remove the unreferenced PDFs.
+    deleted_files, not_removed = [], []
+    if payload.delete_files:
+        for f in plan['deletable']:
+            # A re-upload of the same bytes may have re-created a files row after
+            # the commit above. Check and unlink under one write lock so no insert
+            # can slip in between the check and the unlink.
+            with storage.transaction() as con:
+                con.execute('BEGIN IMMEDIATE')
+                if con.execute('SELECT 1 FROM files WHERE sha256=?', (f['sha256'],)).fetchone():
+                    not_removed.append({'sha256': f['sha256'], 'reason': 'reuploaded'})
+                    continue
+                try:
+                    storage.file_path(f['storage_key']).unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    not_removed.append({'sha256': f['sha256'], 'reason': 'os_error'})
+                    continue
+            deleted_files.append(f['sha256'])
+    return {'status': 'purged', 'kind': kind, 'id': item_id, 'deleted': plan['counts'],
+            'deleted_files': deleted_files, 'files_not_removed': not_removed}

@@ -19,11 +19,12 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records
+from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations
 from .pdf_processing import locate_quote
 
 app = FastAPI(title="EasyResearch", version="0.1.0", description="로컬 연구 자료와 페이지 근거를 관리하는 API")
 app.include_router(library_management.router)
+app.include_router(integrations.router)
 WEB = storage.ROOT / "apps" / "web"
 # Windows may register .mjs as text/plain, which browsers refuse as a module.
 mimetypes.add_type("text/javascript", ".mjs", strict=True)
@@ -293,6 +294,11 @@ def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_
             con.execute("INSERT INTO files(id,sha256,size,storage_key) VALUES(?,?,?,?)", (file_id, sha, size, key))
         else:
             file_id = f["id"]
+        # A concurrent permanent delete removes an unreferenced PDF only while
+        # holding the write lock and only when no files row exists. Re-check
+        # under this lock so a record never points to a removed file.
+        if not storage.file_path(key).is_file():
+            raise HTTPException(409, "PDF를 저장하는 중 파일이 정리되었습니다. 다시 등록해 주세요.")
         p = con.execute("SELECT * FROM papers WHERE file_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1", (file_id,)).fetchone()
         if not p and con.execute("SELECT 1 FROM papers WHERE file_id=? AND deleted_at IS NOT NULL", (file_id,)).fetchone():
             raise HTTPException(409, "이 PDF는 휴지통에 있습니다. 기존 논문을 복구해 주세요.")
@@ -867,9 +873,10 @@ def export_project(project_id: str, format: str = "json"):
                 value = value.replace(char, "\\" + char)
             return value
         entries = []
+        keys = integrations.assign_citekeys(papers)
         for p in papers:
             fields = [("title", p["title"]), ("author", " and ".join(p["authors"])), ("year", p["year"]), ("doi", p["doi"]), ("url", p["source_url"])]
-            entries.append("@misc{er" + p["id"].replace("-", "") + ",\n" + ",\n".join("  " + k + " = {" + escape(v) + "}" for k, v in fields if v) + "\n}")
+            entries.append("@misc{" + keys[p["id"]] + ",\n" + ",\n".join("  " + k + " = {" + escape(v) + "}" for k, v in fields if v) + "\n}")
         body, mime, filename = "\n\n".join(entries), "application/x-bibtex", "easyresearch.bib"
     return Response(content=body, media_type=mime, headers={"Content-Disposition": 'attachment; filename="' + filename + '"'})
 

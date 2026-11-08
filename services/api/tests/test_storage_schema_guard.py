@@ -1,6 +1,7 @@
 """Database version guard tests use isolated, disposable SQLite files."""
 import os
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -22,38 +23,38 @@ class SchemaVersionGuardTests(unittest.TestCase):
 
     def test_new_database_is_initialized_as_current_version(self):
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertIsNotNone(con.execute("SELECT name FROM sqlite_master WHERE name='projects'").fetchone())
 
     def test_existing_v1_and_its_data_survive_reinitialization(self):
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("project", "Existing"))
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT name FROM projects WHERE id='project'").fetchone()[0], "Existing")
 
     def test_unversioned_compatible_database_keeps_its_existing_data(self):
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.executescript(storage.SCHEMA)
             con.execute("INSERT INTO projects(id, name) VALUES (?, ?)", ("old", "Unversioned"))
             con.execute("CREATE TABLE extra_data (content TEXT)")
             con.execute("INSERT INTO extra_data VALUES ('keep')")
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT name FROM projects WHERE id='old'").fetchone()[0], "Unversioned")
             self.assertEqual(con.execute("SELECT content FROM extra_data").fetchone()[0], "keep")
 
     def make_unversioned_v1(self):
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.executescript(storage.SCHEMA_V1)
             con.execute("INSERT INTO projects(id, name) VALUES ('p', '기록 보존')")
 
     def test_unknown_unversioned_database_is_rejected_without_changes(self):
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("CREATE TABLE unrelated(value TEXT)")
             con.execute("INSERT INTO unrelated VALUES ('keep')")
         original = self.database.read_bytes()
@@ -66,10 +67,10 @@ class SchemaVersionGuardTests(unittest.TestCase):
         storage.init_db()
         backups = list((Path(self.temporary.name) / "migration-backups").glob("*.sqlite3"))
         self.assertEqual(len(backups), 1)
-        with sqlite3.connect(str(backups[0])) as snapshot:
+        with closing(sqlite3.connect(str(backups[0]))) as snapshot, snapshot:
             self.assertEqual(snapshot.execute("PRAGMA user_version").fetchone()[0], 0)
             self.assertEqual(snapshot.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
-        with sqlite3.connect(str(self.database)) as live:
+        with closing(sqlite3.connect(str(self.database))) as live, live:
             self.assertEqual(live.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(live.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
 
@@ -81,7 +82,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
         with patch.dict(storage.MIGRATIONS, {0: fail}):
             with self.assertRaisesRegex(RuntimeError, "test migration failure"):
                 storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], 0)
             self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
         self.assertEqual(len(list((Path(self.temporary.name) / "migration-backups").glob("*.sqlite3"))), 1)
@@ -93,7 +94,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
         result = storage.migrate_database_copy(self.database, dest)
         self.assertEqual(result, {"source_version": 0, "target_version": storage.SCHEMA_VERSION, "requires_migration": True})
         self.assertEqual(self.database.read_bytes(), original)
-        with sqlite3.connect(str(dest)) as con:
+        with closing(sqlite3.connect(str(dest))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
         dest_bytes = dest.read_bytes()
@@ -117,7 +118,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
 
     def test_v1_to_future_step_is_atomic_and_version_checked(self):
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("INSERT INTO projects(id, name) VALUES ('p', '기록 보존')")
         schema2 = storage.SCHEMA + "\nCREATE TABLE added (id TEXT PRIMARY KEY);\n"
         def upgrade(con):
@@ -125,13 +126,13 @@ class SchemaVersionGuardTests(unittest.TestCase):
         next_version = storage.SCHEMA_VERSION + 1
         with patch.object(storage, "SCHEMA_VERSION", next_version), patch.dict(storage.SCHEMAS, {next_version: schema2}), patch.dict(storage.MIGRATIONS, {next_version - 1: upgrade}):
             storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], next_version)
             self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
             self.assertIsNotNone(con.execute("SELECT name FROM sqlite_master WHERE name='added'").fetchone())
         backups = list((Path(self.temporary.name) / "migration-backups").glob("*.sqlite3"))
         self.assertEqual(len(backups), 1)
-        with sqlite3.connect(str(backups[0])) as con:
+        with closing(sqlite3.connect(str(backups[0]))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
 
     def test_snapshot_failure_leaves_original_untouched(self):
@@ -144,7 +145,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
 
     def test_invalid_new_schema_rolls_back_all_version_steps(self):
         storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("INSERT INTO projects(id, name) VALUES ('p', '기록 보존')")
         schema2 = storage.SCHEMA + "\nCREATE TABLE expected(id TEXT PRIMARY KEY);\n"
         def bad_upgrade(con):
@@ -154,13 +155,13 @@ class SchemaVersionGuardTests(unittest.TestCase):
         with patch.object(storage, "SCHEMA_VERSION", next_version), patch.dict(storage.SCHEMAS, {next_version: schema2}), patch.dict(storage.MIGRATIONS, {next_version - 1: bad_upgrade}):
             with self.assertRaisesRegex(RuntimeError, "구조"):
                 storage.init_db()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "기록 보존")
             self.assertIsNone(con.execute("SELECT name FROM sqlite_master WHERE name='unexpected'").fetchone())
 
     def test_future_version_copy_does_not_create_destination(self):
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("CREATE TABLE records(value TEXT)")
             con.execute("PRAGMA user_version=9")
         original = self.database.read_bytes()
@@ -172,7 +173,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
 
     def test_invalid_foreign_key_blocks_migration(self):
         self.make_unversioned_v1()
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("INSERT INTO project_papers(project_id,paper_id) VALUES ('missing','missing')")
         original = self.database.read_bytes()
         with self.assertRaisesRegex(RuntimeError, "연결 관계"):
@@ -181,7 +182,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
 
     def test_future_database_is_rejected_without_modification(self):
         future_version = storage.SCHEMA_VERSION + 1
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             con.execute("CREATE TABLE future_records (content TEXT NOT NULL)")
             con.execute("INSERT INTO future_records VALUES ('preserve me')")
             con.execute(f"PRAGMA user_version={future_version}")
@@ -189,7 +190,7 @@ class SchemaVersionGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, rf"데이터 버전\({future_version}\)"):
             storage.init_db()
         self.assertEqual(self.database.read_bytes(), original)
-        with sqlite3.connect(str(self.database)) as con:
+        with closing(sqlite3.connect(str(self.database))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], future_version)
             self.assertEqual(con.execute("SELECT content FROM future_records").fetchone()[0], "preserve me")
             self.assertEqual(con.execute("PRAGMA journal_mode").fetchone()[0], "delete")
