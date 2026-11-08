@@ -19,11 +19,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records
+from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations, reading_library, categories, search_import
 from .pdf_processing import locate_quote
 
 app = FastAPI(title="EasyResearch", version="0.1.0", description="로컬 연구 자료와 페이지 근거를 관리하는 API")
 app.include_router(library_management.router)
+app.include_router(integrations.router)
+app.include_router(reading_library.router)
+app.include_router(categories.router)
+app.include_router(search_import.router)
 WEB = storage.ROOT / "apps" / "web"
 # Windows may register .mjs as text/plain, which browsers refuse as a module.
 mimetypes.add_type("text/javascript", ".mjs", strict=True)
@@ -43,7 +47,12 @@ async def local_boundary(request: Request, call_next):
             return JSONResponse(status_code=403, content={"detail": "허용되지 않은 요청 출처입니다."})
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.headers.get("X-EasyResearch") != "1":
         return JSONResponse(status_code=403, content={"detail": "X-EasyResearch: 1 헤더가 필요합니다."})
-    return await call_next(request)
+    response = await call_next(request)
+    # After an app update the browser must revalidate the page, scripts and
+    # styles (cheap ETag check) instead of mixing cached old and new files.
+    if request.url.path == "/" or (request.url.path.startswith("/assets/") and "/vendor/" not in request.url.path):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 @app.on_event("startup")
@@ -74,7 +83,7 @@ class ProjectUpdate(BaseModel):
 
 
 class PaperFromSearch(BaseModel):
-    project_id: str
+    project_id: Optional[str] = None
     paper: Dict[str, Any]
 
 
@@ -230,19 +239,33 @@ def update_project(project_id: str, payload: ProjectUpdate):
         return rowdict(con.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
 
 
+def paper_with_state(con, paper_id):
+    """A paper with its global reading state; a missing state row means to_read / page 0."""
+    item = paper_dict(con.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())
+    item.update(reading_library.reading_state(con, paper_id))
+    return item
+
+
 @app.get("/api/papers")
 def list_papers(project_id: Optional[str] = None):
     with storage.transaction() as con:
         if project_id:
             require_project(con, project_id)
-            rows = con.execute("SELECT p.*,pp.reading_status,pp.last_page FROM papers p JOIN project_papers pp ON pp.paper_id=p.id WHERE pp.project_id=? AND p.deleted_at IS NULL ORDER BY p.created_at DESC,p.id", (project_id,))
+            # Project-scoped rows keep the project's own values under reading_status/last_page
+            # for existing clients; the global state is exposed as global_* alongside them.
+            rows = con.execute("""SELECT p.*,pp.reading_status,pp.last_page,
+                    COALESCE(rs.reading_status,'to_read') AS global_reading_status,COALESCE(rs.last_page,0) AS global_last_page,
+                    rs.last_opened_at
+                FROM papers p JOIN project_papers pp ON pp.paper_id=p.id LEFT JOIN paper_reading_state rs ON rs.paper_id=p.id
+                WHERE pp.project_id=? AND p.deleted_at IS NULL ORDER BY p.created_at DESC,p.id""", (project_id,))
         else:
-            rows = con.execute("SELECT p.* FROM papers p WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC,p.id")
+            rows = con.execute("""SELECT p.*,COALESCE(rs.reading_status,'to_read') AS reading_status,COALESCE(rs.last_page,0) AS last_page,
+                    rs.last_opened_at FROM papers p LEFT JOIN paper_reading_state rs ON rs.paper_id=p.id
+                WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC,p.id""")
         return [paper_dict(row) for row in rows]
 
 
-@app.post("/api/projects/{project_id}/papers", status_code=201)
-def create_manual_paper(project_id: str, payload: ManualPaperCreate):
+def _manual_paper_fields(payload: ManualPaperCreate):
     title = payload.title.strip()
     if not title:
         raise HTTPException(422, "제목을 입력해 주세요.")
@@ -252,6 +275,23 @@ def create_manual_paper(project_id: str, payload: ManualPaperCreate):
         doi = scholarly.normalize_doi(payload.doi) if payload.doi and payload.doi.strip() else None
     except ValueError as exc:
         raise HTTPException(422, "DOI 형식을 확인해 주세요.") from exc
+    return title, json.dumps([author.strip() for author in payload.authors], ensure_ascii=False), payload.year, doi
+
+
+@app.post("/api/papers", status_code=201)
+def create_library_paper(payload: ManualPaperCreate):
+    title, authors, year, doi = _manual_paper_fields(payload)
+    paper_id = storage.new_id()
+    with storage.transaction() as con:
+        # Always create a distinct record; similarity is only a suggestion.
+        con.execute("INSERT INTO papers(id,title,authors,year,doi,source) VALUES(?,?,?,?,?,'manual')",
+                    (paper_id, title, authors, year, doi))
+        return paper_with_state(con, paper_id)
+
+
+@app.post("/api/projects/{project_id}/papers", status_code=201)
+def create_manual_paper(project_id: str, payload: ManualPaperCreate):
+    title, authors, year, doi = _manual_paper_fields(payload)
     paper_id = storage.new_id()
     with storage.transaction() as con:
         con.execute("BEGIN IMMEDIATE")
@@ -259,19 +299,20 @@ def create_manual_paper(project_id: str, payload: ManualPaperCreate):
         # Always create a distinct record. Similarity is a suggestion for the
         # user to inspect, never an implicit merge or metadata overwrite.
         con.execute("INSERT INTO papers(id,title,authors,year,doi,source) VALUES(?,?,?,?,?,'manual')",
-                    (paper_id, title, json.dumps([author.strip() for author in payload.authors], ensure_ascii=False), payload.year, doi))
+                    (paper_id, title, authors, year, doi))
         library_management.attach_paper(con, project_id, paper_id)
         return paper_dict(con.execute("""SELECT p.*,pp.reading_status,pp.last_page FROM papers p
             JOIN project_papers pp ON pp.paper_id=p.id WHERE p.id=? AND pp.project_id=?""", (paper_id, project_id)).fetchone())
 
 
 @app.post("/api/papers/import", status_code=201)
-def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_id: Optional[str] = Form(default=None)):
+def import_pdf(project_id: Optional[str] = Form(default=None), file: UploadFile = File(...), paper_id: Optional[str] = Form(default=None)):
     with storage.transaction() as con:
-        require_project(con, project_id)
+        if project_id:
+            require_project(con, project_id)
         if paper_id:
             require_paper(con, paper_id)
-            if not con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone():
+            if project_id and not con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone():
                 raise HTTPException(404, "프로젝트에 없는 논문입니다.")
     try:
         sha, size, key = storage.store_stream(file.file)
@@ -281,10 +322,11 @@ def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_
         file.file.close()
     with storage.transaction() as con:
         con.execute("BEGIN IMMEDIATE")
-        require_project(con, project_id)
+        if project_id:
+            require_project(con, project_id)
         if paper_id:
             require_paper(con, paper_id)
-            if not con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone():
+            if project_id and not con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone():
                 raise HTTPException(409, "업로드 중 프로젝트 연결이 바뀌었습니다. 논문 연결을 확인한 뒤 다시 시도해 주세요.")
         f = con.execute("SELECT * FROM files WHERE sha256=?", (sha,)).fetchone()
         duplicate = f is not None
@@ -293,6 +335,11 @@ def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_
             con.execute("INSERT INTO files(id,sha256,size,storage_key) VALUES(?,?,?,?)", (file_id, sha, size, key))
         else:
             file_id = f["id"]
+        # A concurrent permanent delete removes an unreferenced PDF only while
+        # holding the write lock and only when no files row exists. Re-check
+        # under this lock so a record never points to a removed file.
+        if not storage.file_path(key).is_file():
+            raise HTTPException(409, "PDF를 저장하는 중 파일이 정리되었습니다. 다시 등록해 주세요.")
         p = con.execute("SELECT * FROM papers WHERE file_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1", (file_id,)).fetchone()
         if not p and con.execute("SELECT 1 FROM papers WHERE file_id=? AND deleted_at IS NOT NULL", (file_id,)).fetchone():
             raise HTTPException(409, "이 PDF는 휴지통에 있습니다. 기존 논문을 복구해 주세요.")
@@ -308,8 +355,8 @@ def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_
             job_id = existing_job["id"] if existing_job else jobs.enqueue_pdf(con, paper_id)
         elif p:
             paper_id = p["id"]
-            linked = con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone()
-            import_action = 'already_linked' if linked else 'linked_existing'
+            linked = project_id and con.execute("SELECT 1 FROM project_papers WHERE project_id=? AND paper_id=?", (project_id, paper_id)).fetchone()
+            import_action = ('already_linked' if linked else 'linked_existing') if project_id else 'already_exists'
             job_id = None
         else:
             paper_id = storage.new_id()
@@ -317,8 +364,9 @@ def import_pdf(project_id: str = Form(...), file: UploadFile = File(...), paper_
             title = Path(file.filename or "논문.pdf").stem[:500] or "제목 없는 논문"
             con.execute("INSERT INTO papers(id,file_id,title) VALUES(?,?,?)", (paper_id, file_id, title))
             job_id = jobs.enqueue_pdf(con, paper_id)
-        library_management.attach_paper(con, project_id, paper_id)
-        result = paper_dict(con.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())
+        if project_id:
+            library_management.attach_paper(con, project_id, paper_id)
+        result = paper_with_state(con, paper_id)
         result.update({"duplicate": duplicate, "import_action": import_action, "job_id": job_id, "sha256": sha})
         return result
 
@@ -331,7 +379,8 @@ def add_search_paper(payload: PaperFromSearch):
         raise HTTPException(422, "논문 제목이 필요합니다.")
     doi = str(p.get("doi") or "").lower().strip() or None
     with storage.transaction() as con:
-        require_project(con, payload.project_id)
+        if payload.project_id:
+            require_project(con, payload.project_id)
         existing = con.execute("SELECT * FROM papers WHERE doi=? AND deleted_at IS NULL", (doi,)).fetchone() if doi else None
         if existing is None and p.get("source") and p.get("source_id"):
             existing = con.execute("SELECT * FROM papers WHERE source=? AND source_id=? AND deleted_at IS NULL", (p["source"], p["source_id"])).fetchone()
@@ -340,8 +389,9 @@ def add_search_paper(payload: PaperFromSearch):
         else:
             paper_id = storage.new_id()
             con.execute("INSERT INTO papers(id,title,authors,year,doi,source,source_id,source_url,abstract,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?)", (paper_id, title[:500], json.dumps(p.get("authors") or [], ensure_ascii=False), p.get("year"), doi, p.get("source"), p.get("source_id"), p.get("url"), p.get("abstract") or "", json.dumps(p, ensure_ascii=False)))
-        library_management.attach_paper(con, payload.project_id, paper_id)
-        item = paper_dict(con.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())
+        if payload.project_id:
+            library_management.attach_paper(con, payload.project_id, paper_id)
+        item = paper_with_state(con, paper_id)
         item["duplicate"] = existing is not None
         return item
 
@@ -368,20 +418,31 @@ def update_paper(paper_id: str, payload: PaperUpdate):
                 raise HTTPException(422, "DOI 형식을 확인해 주세요.")
             con.execute("UPDATE papers SET doi=? WHERE id=?", (doi, paper_id))
         if payload.reading_status is not None or payload.last_page is not None:
-            if not payload.project_id:
-                raise HTTPException(422, "프로젝트를 지정해 주세요.")
-            require_project(con, payload.project_id)
-            if not con.execute("SELECT 1 FROM project_papers WHERE paper_id=? AND project_id=?", (paper_id, payload.project_id)).fetchone():
-                raise HTTPException(404, "프로젝트에 없는 논문입니다.")
-            if payload.reading_status is not None:
-                if payload.reading_status not in {"to_read", "reading", "read", "on_hold"}:
-                    raise HTTPException(422, "읽기 상태가 올바르지 않습니다.")
-                con.execute("UPDATE project_papers SET reading_status=? WHERE project_id=? AND paper_id=?", (payload.reading_status, payload.project_id, paper_id))
-            if payload.last_page is not None:
-                if paper["page_count"] and payload.last_page >= paper["page_count"]:
-                    raise HTTPException(422, "페이지가 범위를 벗어났습니다.")
-                con.execute("UPDATE project_papers SET last_page=? WHERE project_id=? AND paper_id=?", (payload.last_page, payload.project_id, paper_id))
-        return paper_dict(con.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone())
+            if payload.reading_status is not None and payload.reading_status not in reading_library.READING_STATUSES:
+                raise HTTPException(422, "읽기 상태가 올바르지 않습니다.")
+            if payload.last_page is not None and paper["page_count"] and payload.last_page >= paper["page_count"]:
+                raise HTTPException(422, "페이지가 범위를 벗어났습니다.")
+            if payload.project_id:
+                require_project(con, payload.project_id)
+                if not con.execute("SELECT 1 FROM project_papers WHERE paper_id=? AND project_id=?", (paper_id, payload.project_id)).fetchone():
+                    raise HTTPException(404, "프로젝트에 없는 논문입니다.")
+                if payload.reading_status is not None:
+                    con.execute("UPDATE project_papers SET reading_status=? WHERE project_id=? AND paper_id=?", (payload.reading_status, payload.project_id, paper_id))
+                if payload.last_page is not None:
+                    con.execute("UPDATE project_papers SET last_page=? WHERE project_id=? AND paper_id=?", (payload.last_page, payload.project_id, paper_id))
+            # The global state is always updated; a project id additionally keeps the project link values in step.
+            previous = reading_library.reading_state(con, paper_id)
+            status = payload.reading_status if payload.reading_status is not None else previous["reading_status"]
+            last_page = payload.last_page if payload.last_page is not None else previous["last_page"]
+            opened = payload.last_page is not None and payload.last_page != previous["last_page"]
+            con.execute("""INSERT INTO paper_reading_state(paper_id,reading_status,last_page,last_opened_at,updated_at)
+                VALUES(?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END,CURRENT_TIMESTAMP)
+                ON CONFLICT(paper_id) DO UPDATE SET reading_status=excluded.reading_status,last_page=excluded.last_page,
+                    last_opened_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE paper_reading_state.last_opened_at END,
+                    updated_at=CURRENT_TIMESTAMP""", (paper_id, status, last_page, opened, opened))
+            if status == "read" and previous["reading_status"] != "read":
+                reading_library.on_paper_read(con, paper_id)
+        return paper_with_state(con, paper_id)
 
 
 @app.get("/api/papers/{paper_id}/file")
@@ -867,9 +928,10 @@ def export_project(project_id: str, format: str = "json"):
                 value = value.replace(char, "\\" + char)
             return value
         entries = []
+        keys = integrations.assign_citekeys(papers)
         for p in papers:
             fields = [("title", p["title"]), ("author", " and ".join(p["authors"])), ("year", p["year"]), ("doi", p["doi"]), ("url", p["source_url"])]
-            entries.append("@misc{er" + p["id"].replace("-", "") + ",\n" + ",\n".join("  " + k + " = {" + escape(v) + "}" for k, v in fields if v) + "\n}")
+            entries.append("@misc{" + keys[p["id"]] + ",\n" + ",\n".join("  " + k + " = {" + escape(v) + "}" for k, v in fields if v) + "\n}")
         body, mime, filename = "\n\n".join(entries), "application/x-bibtex", "easyresearch.bib"
     return Response(content=body, media_type=mime, headers={"Content-Disposition": 'attachment; filename="' + filename + '"'})
 

@@ -17,7 +17,7 @@ function lockManager() {
   return {request(name,_options,cb){if(held.has(name))return Promise.resolve(cb(null));held.add(name);return Promise.resolve(cb({name}));}};
 }
 function setup(api, localStorage, tabId='tab-1', locks=lockManager(), randomId=tabId+'-new') {
-  const ids=['project-paper-note','project-note-status','save-project-note','project-note-conflict','project-note-latest','project-note-review','project-note-recovery','project-note-drafts','project-note-recover','edit-metadata','duplicates','pdf-versions','unlink-paper','trash-paper'];
+  const ids=['project-paper-note','project-note-status','save-project-note','project-note-conflict','project-note-latest','project-note-review','project-note-recovery','project-note-drafts','project-note-recover','edit-metadata','duplicates','pdf-versions','unlink-paper','trash-paper','tab-record','reading-status','classify-paper','fetch-topics','paper-categories','paper-projects','paper-topics','add-project-select','add-project-link'];
   const els = Object.fromEntries(ids.map(id => [id, {value:'',disabled:false,hidden:true,isConnected:true,children:[],insertAdjacentHTML(){},append(x){this.children.push(x);if(!this.value)this.value=x.value}}]));
   els['project-paper-note'].disabled=true;els['save-project-note'].disabled=true;
   const head={insertAdjacentHTML(){}};
@@ -26,7 +26,7 @@ function setup(api, localStorage, tabId='tab-1', locks=lockManager(), randomId=t
     $: s => s==='#content .page-head'?head:els[s.slice(1)] || null, esc:String, api, localStorage, sessionStorage,
     navigator:{locks},crypto:{randomUUID:()=>randomId},document:{createElement:()=>({})},error(){},notify(){},console});
   vm.runInContext(code+'\nthis.setup=setupPaperActions;',ctx);
-  return {els,run:()=>ctx.setup({id:'paper',file_id:'file'})};
+  return {els,run:()=>ctx.setup({id:'paper',file_id:'file',projects:[{id:'project',name:'P'}]})};
 }
 
 async function main() {

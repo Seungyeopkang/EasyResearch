@@ -84,7 +84,7 @@ class PaperVersionTests(unittest.TestCase):
         restored = self.send('POST', '/api/backups/restore', files={'file':('backup.zip',archive,'application/zip')})
         self.assertEqual(restored.status_code, 201, restored.text)
         root = Path(restored.json()['restore_path'])
-        with sqlite3.connect(str(root/'library.sqlite3')) as con:
+        with closing(sqlite3.connect(str(root/'library.sqlite3'))) as con, con:
             con.execute('PRAGMA foreign_keys=ON')
             self.assertEqual(con.execute('PRAGMA foreign_key_check').fetchall(), [])
             self.assertEqual(con.execute('SELECT label FROM paper_versions WHERE id=?', (self.version['id'],)).fetchone()[0], 'published')
@@ -154,7 +154,7 @@ class VersionMigrationTests(unittest.TestCase):
             self.assertEqual((root/key).read_bytes(),raw)
             storage.init_db()
             with closing(sqlite3.connect(str(database))) as con:
-                self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],5)
+                self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],storage.SCHEMA_VERSION)
                 self.assertEqual(con.execute('SELECT label FROM paper_versions').fetchone()[0],'old')
                 self.assertEqual(con.execute('SELECT count(*) FROM paper_version_trash').fetchone()[0],0)
             self.assertEqual((root/key).read_bytes(),raw)

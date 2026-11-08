@@ -13,7 +13,7 @@ from typing import Iterator, Optional
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _server_lock = None
 
 
@@ -235,8 +235,48 @@ CREATE TABLE IF NOT EXISTS paper_version_trash (
 );
 """
 SCHEMA_V5 = SCHEMA_V4 + SCHEMA_V5_ADDITIONS
-SCHEMA = SCHEMA_V5
-SCHEMAS = {1: SCHEMA_V1, 2: SCHEMA_V2, 3: SCHEMA_V3, 4: SCHEMA_V4, 5: SCHEMA_V5}
+SCHEMA_V6_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS paper_reading_state (
+ paper_id TEXT PRIMARY KEY REFERENCES papers(id), reading_status TEXT NOT NULL DEFAULT 'to_read',
+ last_page INTEGER NOT NULL DEFAULT 0, last_opened_at TEXT,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS categories (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, keywords_json TEXT NOT NULL DEFAULT '[]',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS paper_categories (
+ paper_id TEXT NOT NULL REFERENCES papers(id), category_id TEXT NOT NULL REFERENCES categories(id),
+ source TEXT NOT NULL, status TEXT NOT NULL, matched_json TEXT NOT NULL DEFAULT '[]',
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(paper_id,category_id)
+);
+CREATE TABLE IF NOT EXISTS paper_topics (
+ paper_id TEXT NOT NULL REFERENCES papers(id), source TEXT NOT NULL, topic_id TEXT NOT NULL,
+ name TEXT NOT NULL, subfield TEXT, field TEXT, score REAL,
+ fetched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(paper_id,source,topic_id)
+);
+"""
+SCHEMA_V6 = SCHEMA_V5 + SCHEMA_V6_ADDITIONS
+SCHEMA = SCHEMA_V6
+SCHEMAS = {1: SCHEMA_V1, 2: SCHEMA_V2, 3: SCHEMA_V3, 4: SCHEMA_V4, 5: SCHEMA_V5, 6: SCHEMA_V6}
+
+# Editable default categories. Only the seeding helper below reads this list.
+DEFAULT_CATEGORIES = [
+    ("최적화", ["optimization", "optimizer", "convergence", "gradient descent", "stochastic gradient", "adam", "learning rate", "hyperparameter", "loss landscape"]),
+    ("경량화", ["pruning", "quantization", "distillation", "knowledge distillation", "compression", "lightweight", "efficient inference", "low-rank", "sparsity", "mobile"]),
+    ("컴퓨터 비전", ["image", "vision", "detection", "segmentation", "convolutional", "visual"]),
+    ("자연어 처리", ["language model", "natural language", "transformer", "translation", "text", "token"]),
+    ("생성 모델", ["generative", "diffusion", "gan", "adversarial", "variational autoencoder"]),
+    ("강화학습", ["reinforcement learning", "policy", "reward", "agent", "q-learning"]),
+]
+
+def _seed_default_categories(con: sqlite3.Connection) -> None:
+    """Insert the default categories once; the unique name keeps reruns harmless."""
+    import json
+    for name, keywords in DEFAULT_CATEGORIES:
+        con.execute("INSERT OR IGNORE INTO categories(id,name,keywords_json) VALUES(?,?,?)",
+                    (new_id(), name, json.dumps(keywords, ensure_ascii=False)))
+
 
 def _check_schema_version(con: sqlite3.Connection) -> int:
     version = con.execute("PRAGMA user_version").fetchone()[0]
@@ -334,7 +374,21 @@ def _migrate_v4_v5(con: sqlite3.Connection) -> None:
     _execute_schema(con, SCHEMA_V5_ADDITIONS)
 
 
-MIGRATIONS = {0: _migrate_unversioned_v1, 1: _migrate_v1_v2, 2: _migrate_v2_v3, 3: _migrate_v3_v4, 4: _migrate_v4_v5}
+def _migrate_v5_v6(con: sqlite3.Connection) -> None:
+    # Reading state moves from project links to papers. Existing project values
+    # are copied, never deleted; the most advanced status across projects wins.
+    _execute_schema(con, SCHEMA_V6_ADDITIONS)
+    con.execute("""INSERT INTO paper_reading_state(paper_id,reading_status,last_page,last_opened_at,updated_at)
+        SELECT p.id,
+          COALESCE((SELECT pp.reading_status FROM project_papers pp WHERE pp.paper_id=p.id
+              ORDER BY CASE pp.reading_status WHEN 'read' THEN 0 WHEN 'reading' THEN 1 WHEN 'on_hold' THEN 2 ELSE 3 END, pp.project_id LIMIT 1),'to_read'),
+          COALESCE((SELECT max(pp.last_page) FROM project_papers pp WHERE pp.paper_id=p.id),0),
+          NULL, CURRENT_TIMESTAMP
+        FROM papers p""")
+    _seed_default_categories(con)
+
+
+MIGRATIONS = {0: _migrate_unversioned_v1, 1: _migrate_v1_v2, 2: _migrate_v2_v3, 3: _migrate_v3_v4, 4: _migrate_v4_v5, 5: _migrate_v5_v6}
 
 
 def _migrate_connection(con: sqlite3.Connection, *, allow_extra: bool = False) -> dict:
@@ -443,6 +497,7 @@ def init_db() -> None:
             con.execute("BEGIN IMMEDIATE")
             try:
                 _execute_schema(con)
+                _seed_default_categories(con)
                 con.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 validate_schema_connection(con)
                 con.commit()

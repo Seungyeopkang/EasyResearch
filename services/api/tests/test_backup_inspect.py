@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from contextlib import closing
 import tempfile
 import unittest
 import zipfile
@@ -175,6 +176,10 @@ class BackupInspectionTests(unittest.TestCase):
         db.write_bytes(entries["library.sqlite3"])
         connection = sqlite3.connect(str(db))
         try:
+            if version <= 5:
+                # Tables introduced in v6 must not appear in an older archive.
+                for table in ("paper_categories", "paper_topics", "paper_reading_state", "categories"):
+                    connection.execute("DROP TABLE IF EXISTS " + table)
             if version <= 4:
                 connection.execute("DROP TABLE IF EXISTS paper_version_trash")
                 connection.execute("DROP TABLE IF EXISTS paper_version_state")
@@ -231,7 +236,7 @@ class BackupInspectionTests(unittest.TestCase):
         self.assertTrue(result.json()["requires_migration"])
         restored = self.client.post("/api/backups/restore", files={"file": ("backup.zip", archive, "application/zip")}, headers=self.headers)
         self.assertEqual(restored.status_code, 201, restored.text)
-        with sqlite3.connect(str(Path(restored.json()["restore_path"]) / "library.sqlite3")) as con:
+        with closing(sqlite3.connect(str(Path(restored.json()["restore_path"]) / "library.sqlite3"))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT count(*) FROM projects").fetchone()[0], 1)
 
@@ -242,9 +247,25 @@ class BackupInspectionTests(unittest.TestCase):
         self.assertEqual(result.json()["database_version"], 2)
         restored = self.client.post("/api/backups/restore", files={"file": ("backup.zip", archive, "application/zip")}, headers=self.headers)
         self.assertEqual(restored.status_code, 201, restored.text)
-        with sqlite3.connect(str(Path(restored.json()["restore_path"]) / "library.sqlite3")) as con:
+        with closing(sqlite3.connect(str(Path(restored.json()["restore_path"]) / "library.sqlite3"))) as con, con:
             self.assertEqual(con.execute("PRAGMA user_version").fetchone()[0], storage.SCHEMA_VERSION)
             self.assertEqual(con.execute("SELECT note FROM project_paper_notes").fetchone()[0], "v2 기록")
+
+    def test_v5_backup_migrates_to_v6_with_default_categories_and_reading_state(self):
+        archive = self.archive_with_database_version(self.backup(), 5)
+        digest = hashlib.sha256(archive).hexdigest()
+        inspected = self.inspect(archive)
+        self.assertEqual(inspected.status_code, 200, inspected.text)
+        self.assertEqual(inspected.json()['database_version'], 5)
+        self.assertTrue(inspected.json()['requires_migration'])
+        restored = self.client.post('/api/backups/restore', files={'file': ('backup.zip', archive, 'application/zip')}, headers=self.headers)
+        self.assertEqual(restored.status_code, 201, restored.text)
+        with closing(sqlite3.connect(str(Path(restored.json()['restore_path']) / 'library.sqlite3'))) as con, con:
+            self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0], storage.SCHEMA_VERSION)
+            self.assertEqual(con.execute('SELECT count(*) FROM categories').fetchone()[0], 6)
+            self.assertEqual(con.execute('SELECT count(*) FROM paper_reading_state').fetchone()[0], 1)
+            self.assertEqual(con.execute('SELECT count(*) FROM projects').fetchone()[0], 1)
+        self.assertEqual(hashlib.sha256(archive).hexdigest(), digest)
 
     def test_v4_backup_restores_extra_pdf_version_without_changing_archive(self):
         self.backup()
@@ -267,7 +288,7 @@ class BackupInspectionTests(unittest.TestCase):
                                     files={'file':('backup.zip',archive,'application/zip')})
         self.assertEqual(restored.status_code,201,restored.text)
         root = Path(restored.json()['restore_path'])
-        with sqlite3.connect(str(root/'library.sqlite3')) as con:
+        with closing(sqlite3.connect(str(root/'library.sqlite3'))) as con, con:
             self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0],storage.SCHEMA_VERSION)
             label,key = con.execute('SELECT v.label,f.storage_key FROM paper_versions v JOIN files f ON f.id=v.file_id').fetchone()
             self.assertEqual(label,'old version')
