@@ -389,3 +389,18 @@ dialog::backdrop { background: rgba(14, 30, 24, .45); }
 /* Long preset labels (AI settings) wrap instead of widening the card. */
 [data-preset]{white-space:normal;text-align:left;max-width:100%;height:auto}
 
+
+/* Research runs: background progress, self-check lists, raw model output, three-column start form */
+.form-row.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 760px) {
+  .form-row.three { grid-template-columns: minmax(0, 1fr); }
+}
+.run-progress { margin: var(--space-1) 0 0; font-size: var(--t-sm); color: var(--ink-2); line-height: 1.6; overflow-wrap: anywhere; min-width: 0; }
+.critique-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); min-width: 0; }
+ol.critique-list { list-style: decimal inside; }
+.critique-list li { font-size: var(--t-sm); line-height: 1.6; color: var(--ink-2); overflow-wrap: anywhere; min-width: 0; }
+.critique-list .chip { white-space: normal; max-width: 100%; overflow-wrap: anywhere; }
+.check-flag { display: inline-block; max-width: 100%; margin: 2px 0; padding: 0 7px; border-radius: 999px; border: 1px solid #ecdcb8; background: var(--warn-soft); color: var(--warn); font-size: var(--t-xs); line-height: 1.6; white-space: normal; overflow-wrap: anywhere; }
+.raw-output { margin: var(--space-1) 0 0; padding: var(--space-2); max-width: 100%; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; font-size: var(--t-xs); line-height: 1.6; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+.step-table details summary { cursor: pointer; color: var(--brand); font-size: var(--t-xs); font-weight: 600; }
+.step-table details { max-width: 100%; min-width: 0; }

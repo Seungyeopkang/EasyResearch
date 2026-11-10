@@ -1,17 +1,22 @@
 """Idea/gap chat threads and the staged research loop.
 
-Contract: docs/exec-plans/active/004-research-assistant.md (Workstream W2).
+Contract: docs/exec-plans/active/004-research-assistant.md (Workstream W2) and
+docs/exec-plans/active/005-research-runtime-hardening.md (W-C).
 
-Every model call goes through llm.preview() and then llm.complete()/complete_json().
-Chat and loop context never include project notes, evidence notes, or other threads.
-Database transactions are never held open across a model call.
+Every model call goes through llm.preview() and then llm.complete().
+A research run advances in a daemon worker thread (one at a time per run).
+Each run has its own short lock around database read-modify-write sections.
+That lock, and every database transaction, is never held during a model call.
+State saves are conditional on the run not being cancelled.
 """
 import hashlib
 import json
 import os
+import random
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -45,16 +50,24 @@ STAGES = ("plan_queries", "search", "screen", "problems", "methods", "contributi
 LLM_STAGES = frozenset(("plan_queries", "problems", "methods", "contributions", "critique"))
 STEPPABLE = frozenset(("ready", "running", "failed_step"))
 TERMINAL = frozenset(("awaiting_review", "completed", "cancelled", "budget_exhausted"))
-SCORE_KEYS = ("novelty", "feasibility", "evidence", "clarity")
-NOVELTY_NOTE = "참신성 점수는 검토를 돕는 추정치이며 판정이 아닙니다. 가장 가까운 선행 연구는 검색 결과일 뿐입니다."
+NOVELTY_NOTE = "가장 가까운 선행 연구는 검색 결과일 뿐이며 참신성 판정이 아닙니다."
+CHECK_NOTE = ("자기 점검은 같은 모델이 쓴 약점과 코드가 계산한 구조 점검입니다. 참신성 판정이 아니며, "
+              "선행 연구 겹침은 검색어와 검색 결과의 단어 겹침일 뿐입니다.")
 STOPWORDS = frozenset(("the", "and", "for", "with", "from", "that", "this", "are", "was", "were",
                        "using", "based", "study", "paper", "results", "our", "their", "into"))
+
+DEFAULT_MAX_RUN_SECONDS = 2700
+MAX_RAW_CHARS = 20000
+INTERRUPTED_ERROR = "중단된 단계입니다. 다시 실행하세요."
+CANCELLED_ERROR = "실행이 취소되었습니다."
+BUDGET_MESSAGES = {"time": "실행 시간 예산을 넘었습니다.", "calls": "AI 호출 예산을 다 썼습니다."}
+TRANSIENT_CODES = frozenset(("timeout", "network_error", "rate_limited"))
 
 PLAN_PURPOSE = "연구 루프: 검색어 설계"
 PROBLEM_PURPOSE = "연구 루프: 문제 찾기"
 METHOD_PURPOSE = "연구 루프: 방법 설계"
 CONTRIBUTION_PURPOSE = "연구 루프: 기여 초안"
-CRITIQUE_PURPOSE = "연구 루프: 검토"
+CRITIQUE_PURPOSE = "연구 루프: 자기 점검"
 
 # The JSON shape each system prompt names is part of the contract (see AGENTS.md: JSON prompts).
 PLAN_SYSTEM = ("당신은 학술 문헌 검색 질의를 설계하는 도우미입니다.\n"
@@ -75,15 +88,17 @@ METHOD_SYSTEM = ("당신은 연구 문제마다 방법 개선안을 설계하는
                  "problem_index는 대상 목록에 있는 번호만 씁니다. 개선안은 검증할 가설로 쓰고 결과를 단정하지 않습니다.\n"
                  "evidence에는 주어진 E 키만 씁니다. 한국어로 씁니다.")
 CONTRIBUTION_SYSTEM = ("당신은 연구 기여 문장의 초안을 쓰는 도우미입니다.\n"
-                       "출력은 아래 형식의 JSON 객체 하나뿐이어야 합니다: {\"contributions\": [{\"statement\": \"...\"}]}\n"
-                       "최대 3개입니다. 가능한 기여의 형태만 쓰고, 참신하거나 우수하다고 주장하지 않습니다.\n"
-                       "근거를 인용할 때는 주어진 E 키만 씁니다. 한국어로 씁니다.")
-CRITIQUE_SYSTEM = ("당신은 독립 리뷰어입니다. 작성자의 초안을 돕기 위해 약점을 찾습니다. 참신성에 대한 판정은 내리지 않습니다.\n"
+                       "출력은 아래 형식의 JSON 객체 하나뿐이어야 합니다: "
+                       "{\"contributions\": [{\"statement\": \"...\", \"search_query\": \"...\"}]}\n"
+                       "최대 3개입니다. statement는 한국어로, 가능한 기여의 형태만 씁니다. "
+                       "참신하거나 우수하다고 주장하지 않습니다.\n"
+                       "search_query는 가장 가까운 선행 연구를 찾기 위한 영어 키워드이며 12단어 이내입니다.")
+CRITIQUE_SYSTEM = ("당신은 독립 점검자입니다. 작성자의 초안에서 근거로 확인할 수 있는 약점을 찾습니다. "
+                   "작성자가 같은 모델일 수 있으므로 칭찬하지 않습니다. 참신성이나 우수성을 판정하지 않으며 점수를 매기지 않습니다.\n"
                    "출력은 아래 형식의 JSON 객체 하나뿐이어야 합니다: "
-                   "{\"scores\": {\"novelty\": 1, \"feasibility\": 1, \"evidence\": 1, \"clarity\": 1}, "
-                   "\"weaknesses\": [\"...\"], \"next_queries\": [\"...\"]}\n"
-                   "점수는 1~5 정수입니다. next_queries는 영어 검색어 0~5개입니다.\n"
-                   "근거를 인용할 때는 주어진 E 키만 씁니다. 한국어로 씁니다.")
+                   "{\"weaknesses\": [{\"text\": \"...\", \"refs\": [\"P1\", \"E2\"]}], \"next_queries\": [\"...\"]}\n"
+                   "refs에는 주어진 키(P, M, C, E 번호)를 하나 이상 씁니다. 연결할 키를 댈 수 없는 약점은 쓰지 않습니다.\n"
+                   "next_queries는 영어 검색어 0~5개입니다. 약점 문장은 한국어로 씁니다.")
 
 
 # ---- request models -------------------------------------------------------
@@ -122,6 +137,7 @@ class RunConfigIn(BaseModel):
     max_iterations: int = Field(default=2, ge=1, le=3)
     papers_per_iteration: int = Field(default=6, ge=3, le=10)
     max_llm_calls: int = Field(default=40, ge=1, le=200)
+    max_run_minutes: int = Field(default=45, ge=5, le=240)
 
 
 class RunCreateIn(RunConfigIn):
@@ -541,7 +557,11 @@ def _run_config(payload: RunConfigIn) -> Dict[str, Any]:
     return {"topic": topic, "project_id": payload.project_id or None,
             "seed_paper_ids": _unique(payload.seed_paper_ids),
             "max_iterations": payload.max_iterations, "papers_per_iteration": payload.papers_per_iteration,
-            "max_llm_calls": payload.max_llm_calls}
+            "max_llm_calls": payload.max_llm_calls, "max_run_seconds": payload.max_run_minutes * 60}
+
+
+def _max_seconds(cfg: Dict[str, Any]) -> int:
+    return int(cfg.get("max_run_seconds") or DEFAULT_MAX_RUN_SECONDS)
 
 
 def _seed_snapshot(con, seed_ids: List[str]) -> List[Dict[str, Any]]:
@@ -627,12 +647,29 @@ def _contribution_messages(topic: str, problems, methods) -> List[Dict[str, str]
     return [{"role": "system", "content": _system(CONTRIBUTION_SYSTEM)}, {"role": "user", "content": "\n\n".join(parts)}]
 
 
+def _critique_problem_lines(problems) -> str:
+    return "\n".join("P%d. %s\n문제: %s\n왜 열려 있는가: %s\n근거: %s" % (
+        i + 1, p["title"], p["statement"], p["why_open"], ", ".join(p["evidence"]))
+        for i, p in enumerate(problems))
+
+
+def _critique_contribution(number: int, contribution: Dict[str, Any]) -> str:
+    listing = "\n".join("- %s (%s)" % (p["title"], p["year"] or "미상")
+                        for p in contribution.get("closest_prior") or []) or "(없음)"
+    block = llm.untrusted_block("C%d 선행 연구" % number,
+                                "검색어: %s\n%s" % (contribution.get("search_query") or "", listing))
+    return "C%d. %s\n%s" % (number, contribution["statement"], block)
+
+
 def _critique_messages(topic: str, problems, methods, contributions, cards) -> List[Dict[str, str]]:
-    parts = ["연구 주제: " + topic, "[문제 후보]\n" + _problem_lines(problems)]
+    parts = ["연구 주제: " + topic, "[문제 후보]\n" + _critique_problem_lines(problems)]
     if methods:
-        parts.append("[방법 초안]\n" + _method_lines(methods))
+        parts.append("[방법 초안]\n" + "\n".join(
+            "M%d (P%d 대상). %s: %s" % (j + 1, m["problem_index"] + 1, m["title"], m["idea"])
+            for j, m in enumerate(methods)))
     if contributions:
-        parts.append("[기여 초안]\n" + "\n".join("- " + c["statement"] for c in contributions))
+        parts.append("[기여 초안]\n" + "\n\n".join(
+            _critique_contribution(n + 1, c) for n, c in enumerate(contributions)))
     parts.append("[근거 카드]\n" + "\n\n".join(_evidence_block(c) for c in cards))
     return [{"role": "system", "content": _system(CRITIQUE_SYSTEM)}, {"role": "user", "content": "\n\n".join(parts)}]
 
@@ -664,7 +701,7 @@ def _prepare_run(payload: RunConfigIn) -> Dict[str, Any]:
 def _initial_state(snapshot, approved_hash: str) -> Dict[str, Any]:
     return {"iteration": 1, "stage_index": 0, "queries": [], "used_queries": [], "candidates": [],
             "evidence": [], "problems": [], "methods": [], "contributions": [], "critique": None,
-            "carry": None, "history": [], "llm_calls": 0, "seed_snapshot": snapshot,
+            "carry": None, "history": [], "llm_calls": 0, "elapsed_seconds": 0, "seed_snapshot": snapshot,
             "approved_hash": approved_hash}
 
 
@@ -686,33 +723,193 @@ STAGE_SCHEMAS = {
     METHOD_PURPOSE: _obj({"methods": {"type": "array", "items": _obj({
         "problem_index": {"type": "integer"}, "title": _STR, "idea": _STR, "expected_gain": _STR,
         "risks": _STR, "evidence": _STRS})}}),
-    CONTRIBUTION_PURPOSE: _obj({"contributions": {"type": "array", "items": _obj({"statement": _STR})}}),
-    CRITIQUE_PURPOSE: _obj({"scores": _obj({k: {"type": "integer"} for k in SCORE_KEYS}),
-                            "weaknesses": _STRS, "next_queries": _STRS}),
+    CONTRIBUTION_PURPOSE: _obj({"contributions": {"type": "array", "items": _obj({
+        "statement": _STR, "search_query": _STR})}}),
+    CRITIQUE_PURPOSE: _obj({"weaknesses": {"type": "array", "items": _obj({"text": _STR, "refs": _STRS})},
+                            "next_queries": _STRS}),
 }
 
 
-class _StepContext:
-    """One LLM call per stage attempt. Counts the call in state and records the hash of the exact prompt."""
+def _require_list(key: str, message: str) -> Callable[[Dict[str, Any]], None]:
+    def check(data: Dict[str, Any]) -> None:
+        if not isinstance(data.get(key), list):
+            raise ValueError(message)
+    return check
 
-    def __init__(self, state: Dict[str, Any]):
-        self.state = state
+
+def _transient(exc: llm.LLMError) -> bool:
+    if exc.code in TRANSIENT_CODES:
+        return True
+    return exc.code == "http_error" and (exc.status or 0) >= 500
+
+
+def _backoff_seconds() -> float:
+    return random.uniform(2.0, 5.0)
+
+
+def _replay_lookup(run_id: str, iteration: int, stage: str, current_step_id: int,
+                   prompt_hash: str) -> Optional[Tuple[str, int]]:
+    """Reuse the raw response of an interrupted step for the same iteration and stage, if it is safe."""
+    with storage.transaction() as con:
+        row = con.execute("SELECT id, status, error, prompt_hash, output_json FROM research_steps "
+                          "WHERE run_id=? AND iteration=? AND stage=? AND id<>? ORDER BY id DESC LIMIT 1",
+                          (run_id, iteration, stage, current_step_id)).fetchone()
+    if row is None:
+        return None
+    if row["status"] != "failed" or row["error"] != INTERRUPTED_ERROR or row["prompt_hash"] != prompt_hash:
+        return None
+    output = json.loads(row["output_json"] or "{}")
+    raw = output.get("raw_response")
+    if not isinstance(raw, str) or not raw.strip() or output.get("raw_truncated"):
+        return None
+    return raw, row["id"]
+
+
+class _StopRun(Exception):
+    """Stops the current step. reason is "cancelled", "time" or "calls"."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason, self.message = reason, message
+
+
+class _StepContext:
+    """One stage attempt. Counts every LLM call in state and records the hash of the exact prompt."""
+
+    def __init__(self, run_id: str, step_id: int, stage: str, state: Dict[str, Any], cfg: Dict[str, Any],
+                 cancel: threading.Event, started: float):
+        self.run_id, self.step_id, self.stage = run_id, step_id, stage
+        self.state, self.cfg, self.cancel, self.started = state, cfg, cancel, started
+        self.max_seconds = _max_seconds(cfg)
+        self.max_calls = int(cfg["max_llm_calls"])
         self.model: Optional[str] = None
         self.prompt_hash: Optional[str] = None
+        self.attempts: List[Dict[str, Any]] = []
+        self.raw: Optional[str] = None
+        self.raw_truncated = False
+        self.stats: Optional[Dict[str, Any]] = None
+        self.runtime: Optional[Dict[str, Any]] = None
+        self.runtime_probed = False
+        self.replayed_from: Optional[int] = None
+        self.stop_kind: Optional[str] = None
+        self.calls = 0
 
-    def ask(self, messages: List[Dict[str, str]], purpose: str, max_tokens: int = 2000) -> Dict[str, Any]:
-        shown = llm.preview(messages, purpose=purpose, json_output=True)
-        self.state["llm_calls"] = int(self.state.get("llm_calls", 0)) + 1
-        self.prompt_hash = shown["preview_hash"]
-        # The run-level approval (D2) covers these calls. Each call still passes the hash of the exact
-        # messages it sends, so llm.complete() checks them against the preview and nothing else is sent.
-        result = llm.complete_json(messages, purpose=purpose, preview_hash=shown["preview_hash"],
-                                   max_tokens=max_tokens, schema=STAGE_SCHEMAS.get(purpose))
-        self.model = result["model"]
-        data = result["data"]
-        if not isinstance(data, dict):
-            raise ValueError("AI 응답이 JSON 객체가 아닙니다.")
-        return data
+    def should_stop(self) -> Optional[str]:
+        if self.cancel.is_set():
+            self.stop_kind = "cancelled"
+            return CANCELLED_ERROR
+        elapsed = float(self.state.get("elapsed_seconds", 0)) + (time.monotonic() - self.started)
+        if elapsed >= self.max_seconds:
+            self.stop_kind = "time"
+            return BUDGET_MESSAGES["time"]
+        return None
+
+    def check_stop(self) -> None:
+        reason = self.should_stop()
+        if reason:
+            raise _StopRun(self.stop_kind or "cancelled", reason)
+
+    def ask(self, messages: List[Dict[str, str]], purpose: str, max_tokens: int = 2000,
+            validate: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        current = list(messages)
+        retried = reasked = False
+        replay_checked = False
+        while True:
+            self.check_stop()
+            shown = llm.preview(current, purpose=purpose, json_output=True)
+            if self.prompt_hash is None:
+                self.prompt_hash = shown["preview_hash"]
+            text: Optional[str] = None
+            replayed = False
+            if not replay_checked:
+                replay_checked = True
+                found = _replay_lookup(self.run_id, self.state["iteration"], self.stage, self.step_id,
+                                       self.prompt_hash)
+                if found is not None:
+                    text, self.replayed_from = found
+                    replayed = True
+            if text is None:
+                if int(self.state.get("llm_calls", 0)) >= self.max_calls:
+                    raise _StopRun("calls", BUDGET_MESSAGES["calls"])
+                self.state["llm_calls"] = int(self.state.get("llm_calls", 0)) + 1
+                self.calls += 1
+                try:
+                    result = llm.complete(current, purpose=purpose, preview_hash=shown["preview_hash"],
+                                          json_output=True, max_tokens=max_tokens,
+                                          schema=STAGE_SCHEMAS.get(purpose), should_stop=self.should_stop)
+                except llm.LLMError as exc:
+                    self.attempts.append({"error": exc.code, "status": exc.status})
+                    if exc.code == "stopped":
+                        raise _StopRun(self.stop_kind or "cancelled", exc.message)
+                    if _transient(exc) and not retried:
+                        retried = True
+                        if self.cancel.wait(_backoff_seconds()):
+                            raise _StopRun("cancelled", CANCELLED_ERROR)
+                        continue
+                    raise
+                text = result["text"]
+                self.model = result.get("model") or self.model
+                self.stats = result.get("stats")
+            self._record_raw(text)
+            if not replayed and not self.runtime_probed:
+                self._probe_runtime()
+            try:
+                data = llm.parse_json(text)
+                if not isinstance(data, dict):
+                    raise ValueError("AI 응답이 JSON 객체가 아닙니다.")
+                if validate is not None:
+                    validate(data)
+            except (llm.LLMError, ValueError) as exc:
+                reason = exc.message if isinstance(exc, llm.LLMError) else str(exc)
+                self.attempts.append({"error": "invalid_output", "reason": reason[:200]})
+                if reasked:
+                    raise ValueError(reason)
+                reasked = True
+                current = list(messages) + [
+                    {"role": "assistant", "content": text[:4000]},
+                    {"role": "user", "content": "이전 응답은 다음 이유로 사용할 수 없습니다: " + reason
+                     + "\n시스템 지시의 JSON 형식을 지켜 JSON 객체 하나만 다시 출력하세요."},
+                ]
+                continue
+            self.attempts.append({"ok": True, "replayed": True} if replayed else {"ok": True})
+            return data
+
+    def _record_raw(self, text: str) -> None:
+        """Save the raw response before it is parsed, so a failure or restart keeps it."""
+        self.raw = text[:MAX_RAW_CHARS]
+        self.raw_truncated = len(text) > MAX_RAW_CHARS
+        output = {"raw_response": self.raw, "raw_truncated": self.raw_truncated, "attempt": self.calls}
+        with storage.transaction() as con:
+            con.execute("UPDATE research_steps SET output_json=?, prompt_hash=?, model=? WHERE id=?",
+                        (_dumps(output), self.prompt_hash, self.model, self.step_id))
+
+    def _probe_runtime(self) -> None:
+        self.runtime_probed = True
+        try:
+            status = llm.runtime_status()
+        except Exception:  # a probe problem must not fail the stage
+            status = {"applicable": False}
+        warning = None
+        if status.get("applicable") and status.get("reachable"):
+            self.runtime = {"gpu_percent": status.get("configured_gpu_percent"), "warning": status.get("warning")}
+            warning = status.get("warning")
+        else:
+            self.runtime = None
+        if warning:
+            self.state["last_runtime_warning"] = warning
+        else:
+            self.state.pop("last_runtime_warning", None)
+
+    def failure_output(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"raw_truncated": self.raw_truncated, "attempts": list(self.attempts)}
+        if self.raw is not None:
+            out["raw_response"] = self.raw
+        return out
+
+    def success_meta(self) -> Dict[str, Any]:
+        meta = {"attempts": list(self.attempts), "stats": self.stats, "runtime": self.runtime,
+                "replayed_from_step": self.replayed_from}
+        return {key: value for key, value in meta.items() if value is not None}
 
 
 def _targets(state: Dict[str, Any]) -> List[int]:
@@ -756,7 +953,6 @@ def _stage_plan(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]) -
 
 
 def _stage_search(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-    key = os.environ.get("OPENALEX_API_KEY") or None
     per = cfg["papers_per_iteration"]
     seen = set()
     seed_items = []
@@ -770,8 +966,9 @@ def _stage_search(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any])
     pools: List[list] = []
     errors: List[Dict[str, str]] = []
     for query in state["queries"]:
+        ctx.check_stop()
         try:
-            pools.append(scholarly.search_openalex(query, limit=per, api_key=key))
+            pools.append(scholarly.search_openalex(query, limit=per))
         except Exception as exc:  # recorded in the step output; the stage continues with other queries
             errors.append({"query": query, "error": _error_text(exc)})
             pools.append([])
@@ -820,6 +1017,12 @@ def _stage_screen(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any])
     return {"evidence": len(evidence), "papers_with_evidence": len({e["source_key"] for e in evidence})}
 
 
+PROBLEM_VALIDATE = _require_list("problems", "문제 목록(problems 배열)이 없습니다.")
+METHOD_VALIDATE = _require_list("methods", "방법 목록(methods 배열)이 없습니다.")
+CONTRIBUTION_VALIDATE = _require_list("contributions", "기여 목록(contributions 배열)이 없습니다.")
+CRITIQUE_VALIDATE = _require_list("weaknesses", "약점 목록(weaknesses 배열)이 없습니다.")
+
+
 def _stage_problems(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     evidence = state["evidence"]
     if not evidence:
@@ -827,7 +1030,8 @@ def _stage_problems(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any
         return {"problems": 0, "skipped": "no_evidence"}
     shown = _fit(evidence, _evidence_block, int(_budget() * 0.8))
     keys = {e["key"] for e in shown}
-    data = ctx.ask(_problem_messages(cfg["topic"], state.get("carry"), shown), PROBLEM_PURPOSE)
+    data = ctx.ask(_problem_messages(cfg["topic"], state.get("carry"), shown), PROBLEM_PURPOSE,
+                   validate=PROBLEM_VALIDATE)
     raw = data.get("problems")
     if not isinstance(raw, list):
         raise ValueError("문제 목록을 받지 못했습니다.")
@@ -870,7 +1074,7 @@ def _stage_methods(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]
     cards = _fit([by_key[k] for k in needed if k in by_key], _evidence_block, int(_budget() * 0.8))
     shown_keys = {c["key"] for c in cards}
     data = ctx.ask(_method_messages(cfg["topic"], [problems[i] for i in targets], cards), METHOD_PURPOSE,
-                   max_tokens=2500)
+                   max_tokens=2500, validate=METHOD_VALIDATE)
     raw = data.get("methods")
     if not isinstance(raw, list):
         raise ValueError("방법 목록을 받지 못했습니다.")
@@ -886,9 +1090,32 @@ def _stage_methods(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]
         methods.append({"problem_index": index, "title": _line(item.get("title"), 200),
                         "idea": _line(item.get("idea"), 1000), "expected_gain": _line(item.get("expected_gain"), 500),
                         "risks": _line(item.get("risks"), 500),
-                        "evidence": valid or list(problems[index]["evidence"])})
+                        "evidence": valid or list(problems[index]["evidence"]),
+                        "evidence_inherited": not valid})
     state["methods"] = methods
     return {"methods": len(methods), "targets": targets}
+
+
+def _overlap_label(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    if value >= 0.6:
+        return "높음"
+    if value >= 0.3:
+        return "보통"
+    return "낮음"
+
+
+def _prior_overlap(query: str, records: List[Dict[str, Any]]) -> Optional[float]:
+    """Largest share of query terms that appear in one search result's title and abstract start."""
+    terms = _terms(query)
+    if not records or not terms:
+        return None
+    best = 0.0
+    for record in records:
+        text = "%s %s" % (record.get("title") or "", (record.get("abstract") or "")[:600])
+        best = max(best, len(terms & _terms(text)) / len(terms))
+    return round(best, 2)
 
 
 def _stage_contributions(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
@@ -897,58 +1124,138 @@ def _stage_contributions(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str
         return {"contributions": 0, "skipped": "no_problems"}
     targets = _targets(state)
     problems = [state["problems"][i] for i in targets]
-    data = ctx.ask(_contribution_messages(cfg["topic"], problems, state["methods"]), CONTRIBUTION_PURPOSE)
+    data = ctx.ask(_contribution_messages(cfg["topic"], problems, state["methods"]), CONTRIBUTION_PURPOSE,
+                   validate=CONTRIBUTION_VALIDATE)
     raw = data.get("contributions")
     if not isinstance(raw, list):
         raise ValueError("기여 목록을 받지 못했습니다.")
-    statements: List[str] = []
+    drafts: List[Tuple[str, Any]] = []
     for item in raw[:3]:
-        text = _line(item.get("statement") if isinstance(item, dict) else item, 500)
-        if text and text not in statements:
-            statements.append(text)
-    key = os.environ.get("OPENALEX_API_KEY") or None
+        statement = _line(item.get("statement") if isinstance(item, dict) else item, 500)
+        if statement and statement not in [s for s, _ in drafts]:
+            drafts.append((statement, item.get("search_query") if isinstance(item, dict) else None))
     contributions: List[Dict[str, Any]] = []
-    for statement in statements:
+    for statement, query in drafts:
+        if isinstance(query, str) and 3 <= len(query.strip()) <= 200:
+            search = _line(query, 200)
+        else:
+            search = statement[:300]
+        ctx.check_stop()
         # The closest prior work is a plain search result, not a novelty verdict.
         prior: List[Dict[str, Any]] = []
         error = None
+        overlap: Optional[float] = None
         try:
-            for record in scholarly.search_openalex(statement[:300], limit=3, api_key=key)[:3]:
-                prior.append({"title": record.get("title") or "", "year": record.get("year"),
-                              "doi": record.get("doi"), "url": record.get("url")})
+            records = scholarly.search_openalex(search, limit=3)[:3]
+            prior = [{"title": r.get("title") or "", "year": r.get("year"), "doi": r.get("doi"), "url": r.get("url")}
+                     for r in records]
+            overlap = _prior_overlap(search, records)
         except Exception as exc:
             error = _error_text(exc)
-        contributions.append({"statement": statement, "closest_prior": prior, "prior_error": error,
-                              "note": NOVELTY_NOTE})
+            prior = []
+            overlap = None
+        contributions.append({"statement": statement, "search_query": search, "closest_prior": prior,
+                              "prior_error": error, "prior_overlap": overlap,
+                              "prior_overlap_label": _overlap_label(overlap), "note": NOVELTY_NOTE})
     state["contributions"] = contributions
     return {"contributions": len(contributions),
             "prior_search_errors": [c["prior_error"] for c in contributions if c["prior_error"]]}
 
 
+def _loop_checks(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Structural checks computed by code. They count evidence and overlap; they do not judge the idea."""
+    evidence = {e["key"]: e for e in state["evidence"]}
+    seeds = {c["key"] for c in state["candidates"] if c.get("source") == "library"}
+    summary = {"single_source": 0, "inherited_evidence": 0, "no_prior_found": 0,
+               "prior_search_failed": 0, "high_prior_overlap": 0}
+    problems_out = []
+    for i, problem in enumerate(state["problems"]):
+        keys = [k for k in problem["evidence"] if k in evidence]
+        sources = {evidence[k]["source_key"] for k in keys}
+        seed_count = sum(1 for k in keys if evidence[k]["source_key"] in seeds)
+        flags = ["single_source"] if len(sources) < 2 else []
+        summary["single_source"] += len(flags)
+        problems_out.append({"key": "P%d" % (i + 1), "title": problem["title"],
+                             "evidence_count": len(problem["evidence"]), "source_papers": len(sources),
+                             "seed_evidence": seed_count, "flags": flags})
+    methods_out = []
+    for j, method in enumerate(state["methods"]):
+        inherited = bool(method.get("evidence_inherited"))
+        summary["inherited_evidence"] += int(inherited)
+        methods_out.append({"key": "M%d" % (j + 1), "problem": "P%d" % (method["problem_index"] + 1),
+                            "evidence_inherited": inherited, "flags": ["inherited_evidence"] if inherited else []})
+    contributions_out = []
+    for n, contribution in enumerate(state["contributions"]):
+        prior = contribution.get("closest_prior") or []
+        flags: List[str] = []
+        if contribution.get("prior_error"):
+            flags.append("prior_search_failed")
+            summary["prior_search_failed"] += 1
+        elif not prior:
+            flags.append("no_prior_found")
+            summary["no_prior_found"] += 1
+        overlap = contribution.get("prior_overlap")
+        if overlap is not None and overlap >= 0.6:
+            flags.append("high_prior_overlap")
+            summary["high_prior_overlap"] += 1
+        contributions_out.append({"key": "C%d" % (n + 1), "search_query": contribution.get("search_query"),
+                                  "closest_prior_count": len(prior), "prior_overlap": overlap,
+                                  "prior_overlap_label": contribution.get("prior_overlap_label"), "flags": flags})
+    return {"problems": problems_out, "methods": methods_out, "contributions": contributions_out,
+            "summary": summary}
+
+
+def _critique_keys(state: Dict[str, Any], shown_keys: set) -> set:
+    keys = set(shown_keys)
+    keys.update("P%d" % (i + 1) for i in range(len(state["problems"])))
+    keys.update("M%d" % (j + 1) for j in range(len(state["methods"])))
+    keys.update("C%d" % (n + 1) for n in range(len(state["contributions"])))
+    return keys
+
+
+def _parse_weaknesses(raw: Any, valid: set) -> Tuple[List[Dict[str, Any]], int]:
+    """Keep weaknesses that cite at least one valid key. Returns (kept, dropped_uncited)."""
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    items = raw if isinstance(raw, list) else []
+    for item in items[:16]:
+        if isinstance(item, dict):
+            text = _line(item.get("text"), 300)
+            raw_refs = item.get("refs")
+        else:
+            text = _line(item, 300)
+            raw_refs = None
+        refs = [r for r in _unique(r.strip() for r in (raw_refs or []) if isinstance(r, str)) if r in valid]
+        if not text or not refs:
+            dropped += 1
+            continue
+        kept.append({"text": text, "refs": refs})
+        if len(kept) >= 8:
+            break
+    return kept, dropped
+
+
 def _stage_critique(ctx: _StepContext, cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    checks = _loop_checks(state)
     if not state["problems"]:
-        state["critique"] = {"scores": None, "weaknesses": ["근거 기반 문제 후보가 없어 검토하지 않았습니다."],
-                             "next_queries": [], "note": NOVELTY_NOTE}
-        return {"skipped": "no_problems"}
+        state["critique"] = {"weaknesses": [], "next_queries": [], "checks": checks, "dropped_uncited": 0,
+                             "note": "근거 기반 문제 후보가 없어 점검하지 않았습니다. " + CHECK_NOTE,
+                             "skipped": "no_problems"}
+        return {"skipped": "no_problems", "weaknesses": 0, "dropped_uncited": 0, "next_queries": [],
+                "check_summary": checks["summary"]}
     by_key = {e["key"]: e for e in state["evidence"]}
     needed = _unique([k for p in state["problems"] for k in p["evidence"]])
     cards = _fit([by_key[k] for k in needed if k in by_key], _evidence_block, int(_budget() * 0.8))
     data = ctx.ask(_critique_messages(cfg["topic"], state["problems"], state["methods"],
-                                      state["contributions"], cards), CRITIQUE_PURPOSE, max_tokens=1500)
-    raw_scores = data.get("scores")
-    if not isinstance(raw_scores, dict):
-        raise ValueError("점수를 받지 못했습니다.")
-    scores: Dict[str, int] = {}
-    for name in SCORE_KEYS:
-        value = raw_scores.get(name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("점수 형식이 올바르지 않습니다.")
-        scores[name] = min(5, max(1, int(round(value))))
-    weaknesses = _clean_list(_str_items(data.get("weaknesses")), 8, 300)
+                                      state["contributions"], cards), CRITIQUE_PURPOSE, max_tokens=1500,
+                   validate=CRITIQUE_VALIDATE)
+    valid = _critique_keys(state, {c["key"] for c in cards})
+    weaknesses, dropped = _parse_weaknesses(data.get("weaknesses"), valid)
     next_queries = _clean_list(_str_items(data.get("next_queries")), 5, 200)
-    state["critique"] = {"scores": scores, "weaknesses": weaknesses, "next_queries": next_queries,
-                         "note": NOVELTY_NOTE}
-    return {"scores": scores, "weaknesses": weaknesses, "next_queries": next_queries}
+    state["critique"] = {"weaknesses": weaknesses, "next_queries": next_queries, "checks": checks,
+                         "dropped_uncited": dropped, "note": CHECK_NOTE}
+    return {"weaknesses": len(weaknesses), "dropped_uncited": dropped, "next_queries": next_queries,
+            "check_summary": checks["summary"]}
 
 
 STAGE_FUNCS = {"plan_queries": _stage_plan, "search": _stage_search, "screen": _stage_screen,
@@ -967,8 +1274,86 @@ def _needs_llm(stage: str, state: Dict[str, Any]) -> bool:
 
 
 # ---- research loop: persistence and engine --------------------------------
+#
+# Lock order: a run lock first, then _REGISTRY_LOCK. Never the reverse.
+# Run locks cover short database sections only. Nothing holds a lock during a model call.
 
-RUN_LOCK = threading.RLock()
+_REGISTRY_LOCK = threading.Lock()
+_WORKERS: Dict[str, "_RunWorker"] = {}
+_RUN_LOCKS: Dict[str, threading.Lock] = {}
+
+
+def _run_lock(run_id: str) -> threading.Lock:
+    with _REGISTRY_LOCK:
+        lock = _RUN_LOCKS.get(run_id)
+        if lock is None:
+            lock = _RUN_LOCKS[run_id] = threading.Lock()
+        return lock
+
+
+def _active_worker_locked(run_id: str) -> Optional["_RunWorker"]:
+    worker = _WORKERS.get(run_id)
+    if worker is None:
+        return None
+    # ident is None until start(): a registered worker that has not started yet still counts as busy.
+    if worker.thread.is_alive() or worker.thread.ident is None:
+        return worker
+    return None
+
+
+def _active_worker(run_id: str) -> Optional["_RunWorker"]:
+    with _REGISTRY_LOCK:
+        return _active_worker_locked(run_id)
+
+
+class _RunWorker:
+    def __init__(self, run_id: str, mode: str):  # mode: "step" or "advance"
+        self.run_id, self.mode = run_id, mode
+        self.cancel = threading.Event()
+        self.thread = threading.Thread(target=self._main, name="research-run-" + run_id[:8], daemon=True)
+
+    def _main(self) -> None:
+        try:
+            for _ in range(200):
+                if self.cancel.is_set():
+                    break
+                status = _execute_step(self.run_id, self.cancel)
+                if self.mode == "step" or status != "ready":
+                    break
+        except Exception as exc:  # engine bug: never leave the run stuck
+            _mark_engine_error(self.run_id, exc)
+        finally:
+            with _REGISTRY_LOCK:
+                if _WORKERS.get(self.run_id) is self:
+                    del _WORKERS[self.run_id]
+
+
+def _join_workers(timeout: float = 10.0) -> bool:
+    """For tests: wait up to timeout seconds for live worker threads. True when none remain alive."""
+    deadline = time.monotonic() + timeout
+    with _REGISTRY_LOCK:
+        workers = list(_WORKERS.values())
+    for worker in workers:
+        if worker.thread.ident is None:
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        worker.thread.join(remaining)
+    return not any(w.thread.is_alive() for w in workers)
+
+
+def _mark_engine_error(run_id: str, exc: BaseException) -> None:
+    text = _error_text(exc)
+    try:
+        with _run_lock(run_id):
+            with storage.transaction() as con:
+                con.execute("UPDATE research_steps SET status='failed', error=?, finished_at=CURRENT_TIMESTAMP "
+                            "WHERE run_id=? AND status='running'", (text, run_id))
+                con.execute("UPDATE research_runs SET status='failed_step', updated_at=CURRENT_TIMESTAMP "
+                            "WHERE id=? AND status <> 'cancelled'", (run_id,))
+    except Exception:  # the database itself is unavailable; nothing more can be recorded
+        return
 
 
 def _write_run(con, run_id: str, status: str, state: Dict[str, Any]) -> None:
@@ -976,9 +1361,12 @@ def _write_run(con, run_id: str, status: str, state: Dict[str, Any]) -> None:
                 (status, _dumps(state), run_id))
 
 
-def _save_run(run_id: str, status: str, state: Dict[str, Any]) -> None:
+def _save_guarded(run_id: str, status: str, state: Dict[str, Any]) -> bool:
+    """Save unless the user cancelled the run meanwhile. False means it was cancelled: never overwrite."""
     with storage.transaction() as con:
-        _write_run(con, run_id, status, state)
+        cursor = con.execute("UPDATE research_runs SET status=?, state_json=?, updated_at=CURRENT_TIMESTAMP "
+                             "WHERE id=? AND status <> 'cancelled'", (status, _dumps(state), run_id))
+        return cursor.rowcount == 1
 
 
 def _load_run(con, run_id: str):
@@ -988,13 +1376,22 @@ def _load_run(con, run_id: str):
     return row
 
 
-def _run_view(row) -> Dict[str, Any]:
+def _run_view(row, busy: Optional[bool] = None) -> Dict[str, Any]:
+    # Callers pass ``busy`` read BEFORE the row: a worker that finishes in between then shows
+    # busy=True with its final status (one extra poll), never a stale "running" with busy=False.
+    if busy is None:
+        busy = _active_worker(row["id"]) is not None
     state = json.loads(row["state_json"])
+    cfg = json.loads(row["config_json"])
     index = state["stage_index"]
     stage = STAGES[index] if index < len(STAGES) and row["status"] not in ("completed", "cancelled") else None
     return {"id": row["id"], "project_id": row["project_id"], "topic": row["topic"], "status": row["status"],
-            "config": json.loads(row["config_json"]), "iteration": state["iteration"], "stage": stage,
-            "llm_calls": state["llm_calls"], "created_at": row["created_at"], "updated_at": row["updated_at"]}
+            "config": cfg, "iteration": state["iteration"], "stage": stage,
+            "llm_calls": state["llm_calls"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "busy": busy,
+            "elapsed_seconds": round(float(state.get("elapsed_seconds", 0)), 1),
+            "max_run_seconds": _max_seconds(cfg), "max_llm_calls": int(cfg["max_llm_calls"]),
+            "stop_reason": state.get("stop_reason"), "runtime_warning": state.get("last_runtime_warning")}
 
 
 def _step_view(row) -> Dict[str, Any]:
@@ -1005,9 +1402,10 @@ def _step_view(row) -> Dict[str, Any]:
 
 
 def _run_detail(con, run_id: str) -> Dict[str, Any]:
+    busy = _active_worker(run_id) is not None
     row = _load_run(con, run_id)
     steps = [_step_view(s) for s in con.execute("SELECT * FROM research_steps WHERE run_id=? ORDER BY id", (run_id,))]
-    return {"run": _run_view(row), "steps": steps, "state": json.loads(row["state_json"])}
+    return {"run": _run_view(row, busy), "steps": steps, "state": json.loads(row["state_json"])}
 
 
 def _step_input(stage: str, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1018,44 +1416,76 @@ def _step_input(stage: str, state: Dict[str, Any]) -> Dict[str, Any]:
             "llm_calls_before": state["llm_calls"]}
 
 
-def _execute_step(run_id: str) -> str:
+def _elapsed(state: Dict[str, Any], started: float) -> None:
+    state["elapsed_seconds"] = round(float(state.get("elapsed_seconds", 0)) + (time.monotonic() - started), 1)
+
+
+def _budget_stop(run_id: str, state: Dict[str, Any], reason: str) -> str:
+    state["stop_reason"] = reason
+    if _save_guarded(run_id, "budget_exhausted", state):
+        return "budget_exhausted"
+    return "cancelled"
+
+
+def _execute_step(run_id: str, cancel: Optional[threading.Event] = None) -> str:
     """Run the next stage once. Returns the resulting run status."""
-    with RUN_LOCK:
+    cancel = cancel or threading.Event()
+    with _run_lock(run_id):
         with storage.transaction() as con:
             row = _load_run(con, run_id)
+            if row["status"] == "cancelled":
+                return "cancelled"
             if row["status"] not in STEPPABLE:
-                raise HTTPException(409, {"code": "run_not_steppable", "message": "이 실행은 더 진행할 수 없습니다."})
+                return row["status"]
             cfg = json.loads(row["config_json"])
             state = json.loads(row["state_json"])
             con.execute("UPDATE research_steps SET status='failed', error=?, finished_at=CURRENT_TIMESTAMP "
-                        "WHERE run_id=? AND status='running'", ("중단된 단계입니다. 다시 실행하세요.", run_id))
+                        "WHERE run_id=? AND status='running'", (INTERRUPTED_ERROR, run_id))
         stage = STAGES[state["stage_index"]]
         iteration = state["iteration"]
-        if stage in LLM_STAGES and _needs_llm(stage, state) and state["llm_calls"] >= cfg["max_llm_calls"]:
-            _save_run(run_id, "budget_exhausted", state)
-            return "budget_exhausted"
+        if float(state.get("elapsed_seconds", 0)) >= _max_seconds(cfg):
+            return _budget_stop(run_id, state, "time")
+        if stage in LLM_STAGES and _needs_llm(stage, state) and int(state["llm_calls"]) >= int(cfg["max_llm_calls"]):
+            return _budget_stop(run_id, state, "calls")
         with storage.transaction() as con:
             cursor = con.execute("INSERT INTO research_steps(run_id,iteration,stage,status,input_json) VALUES(?,?,?,?,?)",
                                  (run_id, iteration, stage, "running", _dumps(_step_input(stage, state))))
             step_id = cursor.lastrowid
-        _save_run(run_id, "running", state)
-        ctx = _StepContext(state)
-        try:
-            output = STAGE_FUNCS[stage](ctx, cfg, state)
-        except Exception as exc:  # recorded on the step row; the same stage can be retried
-            _finish_step(step_id, "failed", {}, _error_text(exc), ctx.model, ctx.prompt_hash)
-            _save_run(run_id, "failed_step", state)
+        if not _save_guarded(run_id, "running", state):
+            _finish_step(step_id, "cancelled", {}, CANCELLED_ERROR, None, None)
+            return "cancelled"
+    ctx = _StepContext(run_id, step_id, stage, state, cfg, cancel, time.monotonic())
+    try:
+        output = STAGE_FUNCS[stage](ctx, cfg, state)
+    except _StopRun as stop:
+        _elapsed(state, ctx.started)
+        if stop.reason == "cancelled":
+            _finish_step(step_id, "cancelled", ctx.failure_output(), CANCELLED_ERROR, ctx.model, ctx.prompt_hash)
+            return "cancelled"
+        state["stop_reason"] = stop.reason
+        _finish_step(step_id, "failed", ctx.failure_output(), stop.message, ctx.model, ctx.prompt_hash)
+        if _save_guarded(run_id, "budget_exhausted", state):
+            return "budget_exhausted"
+        return "cancelled"
+    except Exception as exc:  # recorded on the step row; the same stage can be retried
+        _elapsed(state, ctx.started)
+        _finish_step(step_id, "failed", ctx.failure_output(), _error_text(exc), ctx.model, ctx.prompt_hash)
+        if _save_guarded(run_id, "failed_step", state):
             return "failed_step"
-        if ctx.model:
-            state["last_model"] = ctx.model
-        state["stage_index"] = state["stage_index"] + 1
-        if stage == "critique":
-            status = "awaiting_review" if iteration < cfg["max_iterations"] else "completed"
-        else:
-            status = "ready"
-        _finish_step(step_id, "done", output, None, ctx.model, ctx.prompt_hash)
-        _save_run(run_id, status, state)
-        return status
+        return "cancelled"
+    _elapsed(state, ctx.started)
+    state["stage_index"] = state["stage_index"] + 1
+    if stage == "critique":
+        status = "awaiting_review" if iteration < int(cfg["max_iterations"]) else "completed"
+    else:
+        status = "ready"
+    if ctx.model:
+        state["last_model"] = ctx.model
+    if not _save_guarded(run_id, status, state):
+        _finish_step(step_id, "cancelled", ctx.failure_output(), CANCELLED_ERROR, ctx.model, ctx.prompt_hash)
+        return "cancelled"
+    _finish_step(step_id, "done", {**output, **ctx.success_meta()}, None, ctx.model, ctx.prompt_hash)
+    return status
 
 
 def _finish_step(step_id: int, status: str, output: Dict[str, Any], error: Optional[str],
@@ -1066,12 +1496,37 @@ def _finish_step(step_id: int, status: str, output: Dict[str, Any], error: Optio
                     (status, _dumps(output), error, model, prompt_hash, step_id))
 
 
+def _start_worker(run_id: str, mode: str) -> Dict[str, Any]:
+    with _run_lock(run_id):
+        with storage.transaction() as con:
+            row = _load_run(con, run_id)
+            if row["status"] not in STEPPABLE:
+                raise HTTPException(409, {"code": "run_not_steppable", "message": "이 실행은 더 진행할 수 없습니다."})
+        with _REGISTRY_LOCK:
+            if _active_worker_locked(run_id) is not None:
+                raise HTTPException(409, {"code": "run_busy", "message": "이 실행은 이미 진행 중입니다."})
+            worker = _RunWorker(run_id, mode)
+            _WORKERS[run_id] = worker
+        try:
+            with storage.transaction() as con:
+                con.execute("UPDATE research_runs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (run_id,))
+            worker.thread.start()
+        except Exception:
+            with _REGISTRY_LOCK:
+                if _WORKERS.get(run_id) is worker:
+                    del _WORKERS[run_id]
+            raise
+    with storage.transaction() as con:
+        return _run_detail(con, run_id)
+
+
 def _iteration_summary(state: Dict[str, Any], note: str) -> Dict[str, Any]:
     critique = state.get("critique") or {}
     return {"iteration": state["iteration"], "queries": list(state["queries"]),
             "candidate_count": len(state["candidates"]), "evidence_count": len(state["evidence"]),
-            "problem_titles": [p["title"] for p in state["problems"]], "scores": critique.get("scores"),
-            "note": note}
+            "problem_titles": [p["title"] for p in state["problems"]],
+            "check_summary": (critique.get("checks") or {}).get("summary"), "note": note}
 
 
 # ---- research loop: routes ------------------------------------------------
@@ -1085,9 +1540,11 @@ def preview_research_run(payload: RunConfigIn):
 
 @router.get("/api/research-runs")
 def list_research_runs():
+    with _REGISTRY_LOCK:
+        busy_ids = {run_id for run_id in _WORKERS if _active_worker_locked(run_id) is not None}
     with storage.transaction() as con:
         rows = con.execute("SELECT * FROM research_runs ORDER BY created_at DESC, rowid DESC").fetchall()
-        return [_run_view(r) for r in rows]
+        return [_run_view(r, r["id"] in busy_ids) for r in rows]
 
 
 @router.post("/api/research-runs", status_code=201)
@@ -1113,27 +1570,22 @@ def get_research_run(run_id: str):
         return _run_detail(con, run_id)
 
 
-@router.post("/api/research-runs/{run_id}/step")
+@router.post("/api/research-runs/{run_id}/step", status_code=202)
 def step_research_run(run_id: str):
-    _execute_step(run_id)
-    with storage.transaction() as con:
-        return _run_detail(con, run_id)
+    return _start_worker(run_id, "step")
 
 
-@router.post("/api/research-runs/{run_id}/advance")
+@router.post("/api/research-runs/{run_id}/advance", status_code=202)
 def advance_research_run(run_id: str):
-    for _ in range(200):
-        status = _execute_step(run_id)
-        if status not in ("ready", "running"):
-            break
-    with storage.transaction() as con:
-        return _run_detail(con, run_id)
+    return _start_worker(run_id, "advance")
 
 
 @router.post("/api/research-runs/{run_id}/feedback")
 def feedback_research_run(run_id: str, payload: FeedbackIn):
     note = payload.note.strip()
-    with RUN_LOCK:
+    with _run_lock(run_id):
+        if _active_worker(run_id) is not None:
+            raise HTTPException(409, {"code": "run_busy", "message": "이 실행은 이미 진행 중입니다."})
         with storage.transaction() as con:
             row = _load_run(con, run_id)
             if row["status"] != "awaiting_review":
@@ -1144,12 +1596,14 @@ def feedback_research_run(run_id: str, payload: FeedbackIn):
                 raise HTTPException(422, "선택한 문제 번호가 없습니다.")
             critique = state.get("critique") or {}
             state["history"].append(_iteration_summary(state, note))
-            state["carry"] = {"weaknesses": list(critique.get("weaknesses", [])),
+            state["carry"] = {"weaknesses": [w.get("text") if isinstance(w, dict) else str(w)
+                                             for w in critique.get("weaknesses", [])],
                               "next_queries": list(critique.get("next_queries", [])),
                               "note": note,
                               "focus_title": state["problems"][focus]["title"] if focus is not None else None}
             state["iteration"] += 1
             state["stage_index"] = 0
+            state.pop("stop_reason", None)
             for field in ("queries", "candidates", "evidence", "problems", "methods", "contributions"):
                 state[field] = []
             state["critique"] = None
@@ -1159,13 +1613,21 @@ def feedback_research_run(run_id: str, payload: FeedbackIn):
 
 @router.post("/api/research-runs/{run_id}/cancel")
 def cancel_research_run(run_id: str):
-    with RUN_LOCK:
+    with _run_lock(run_id):
         with storage.transaction() as con:
-            row = _load_run(con, run_id)
-            if row["status"] in ("completed", "cancelled"):
+            _load_run(con, run_id)
+            changed = con.execute("UPDATE research_runs SET status='cancelled', updated_at=CURRENT_TIMESTAMP "
+                                  "WHERE id=? AND status NOT IN ('completed','cancelled')", (run_id,)).rowcount
+            if not changed:
                 raise HTTPException(409, {"code": "run_finished", "message": "이미 끝난 실행입니다."})
-            _write_run(con, run_id, "cancelled", json.loads(row["state_json"]))
-            return _run_detail(con, run_id)
+            worker = _active_worker(run_id)
+            if worker is not None:
+                worker.cancel.set()  # the worker marks its own running step as cancelled
+            else:
+                con.execute("UPDATE research_steps SET status='cancelled', error=?, finished_at=CURRENT_TIMESTAMP "
+                            "WHERE run_id=? AND status='running'", (CANCELLED_ERROR, run_id))
+    with storage.transaction() as con:
+        return _run_detail(con, run_id)
 
 
 def _pick(indices: List[int], items: list, label: str) -> List[int]:

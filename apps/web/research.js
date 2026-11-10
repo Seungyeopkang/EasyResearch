@@ -294,6 +294,12 @@ export async function showAISettings(ctx) {
   <section class="card card-pad"><h2 class="section-title">연결 확인</h2><p class="help">짧은 테스트 문장을 보냅니다. 외부 서버라면 보내기 전에 내용을 확인합니다.</p>
     <div class="actions start"><button class="secondary" id="ai-test" type="button" ${cfg.enabled ? '' : 'disabled'}>연결 확인</button></div>
     <div id="ai-test-result" class="text-output" aria-live="polite"></div></section>
+  <section class="card card-pad"><h2 class="section-title">로컬 모델 상태</h2>
+    <p class="help">이 PC의 Ollama가 모델을 GPU에서 돌리는지 확인합니다. 다른 제공자에는 적용되지 않습니다.</p>
+    <div class="actions start"><button class="secondary" id="ai-status" type="button">상태 확인</button></div>
+    <div id="ai-status-result" class="stack" aria-live="polite"></div></section>
+  <section class="card card-pad"><h2 class="section-title">OpenAlex 검색</h2>
+    <div id="openalex-body" class="stack"><p class="help">불러오는 중입니다.</p></div></section>
   <section class="card card-pad"><h2 class="section-title">선택 안내</h2>
     <ul class="help">
       <li><strong>Ollama (이 PC)</strong>: 무료입니다. 인터넷이 필요 없고 논문 내용이 이 PC 밖으로 나가지 않습니다. 기본값입니다.</li>
@@ -336,6 +342,8 @@ export async function showAISettings(ctx) {
       button.disabled = false;
     }
   };
+  bindLocalStatus(ctx);
+  loadOpenAlexSettings(ctx).catch(() => {});
   const testButton = ctx.$('#ai-test');
   if (testButton) testButton.onclick = async () => {
     const output = ctx.$('#ai-test-result');
@@ -344,10 +352,119 @@ export async function showAISettings(ctx) {
     try {
       const result = await sendWithPreview(ctx, '/api/ai/test/preview', '/api/ai/test', {}, {busyText: '연결을 확인하는 중입니다. 로컬 모델은 첫 응답에 시간이 걸릴 수 있습니다.'});
       output.textContent = result ? `연결 성공 · ${result.provider} · ${result.model}\n응답: ${result.reply}` : '연결 확인을 취소했습니다.';
+      if (result && result.runtime?.warning) output.textContent += `\n경고: ${result.runtime.warning}`;
     } catch (err) {
       ctx.error(err);
     } finally {
       testButton.disabled = false;
+    }
+  };
+}
+
+// Best-effort check after an AI call: shows the runtime warning from /api/ai/status when there is one.
+async function notifyRuntimeWarning(ctx) {
+  try {
+    const status = await ctx.api('/api/ai/status');
+    const warning = status?.runtime?.warning;
+    if (warning) ctx.notify(String(warning), 'warning');
+  } catch {
+    // The status check is supplementary; failures are ignored on purpose.
+  }
+}
+
+function localStatusHtml(status) {
+  const runtime = status?.runtime || {};
+  if (!runtime.applicable) return '<p class="help">이 확인은 이 PC의 Ollama 연결에만 적용됩니다.</p>';
+  if (!runtime.reachable) return '<div class="notice warning">Ollama에 연결할 수 없습니다. Ollama가 실행 중인지 확인하세요.</div>';
+  const models = arr(runtime.models);
+  const list = models.length
+    ? `<ul class="critique-list">${models.map(m => `<li>${esc(m?.name || '')} · ${m?.gpu_percent == null ? 'GPU 정보 없음' : `GPU ${esc(m.gpu_percent)}%`}</li>`).join('')}</ul>`
+    : '<p class="help">설치된 모델 정보가 없습니다.</p>';
+  const configured = runtime.configured_model
+    ? `<p class="help">설정한 모델 ${esc(runtime.configured_model)}: ${runtime.configured_loaded ? `메모리에 올라와 있음 · GPU ${esc(runtime.configured_gpu_percent ?? '-')}%` : '메모리에 올라와 있지 않음'}</p>`
+    : '';
+  return `${list}${configured}${runtime.warning ? `<div class="notice warning">${esc(runtime.warning)}</div>` : ''}`;
+}
+
+function bindLocalStatus(ctx) {
+  const button = ctx.$('#ai-status');
+  if (!button) return;
+  button.onclick = async () => {
+    button.disabled = true;
+    try {
+      const status = await ctx.api('/api/ai/status');
+      const output = ctx.$('#ai-status-result');
+      if (output) output.innerHTML = localStatusHtml(status);
+    } catch (err) {
+      ctx.error(err);
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
+const fmtUsd = value => {
+  const n = Number(value);
+  return Number.isFinite(n) ? `$${n.toLocaleString('en-US', {maximumFractionDigits: 4})}` : '-';
+};
+
+function resetText(seconds) {
+  const sec = Number(seconds);
+  if (!Number.isFinite(sec) || sec < 0) return '다시 채워지는 시각을 모릅니다';
+  return sec < 3600 ? `약 ${Math.max(1, Math.round(sec / 60))}분 후 다시 채워짐` : `약 ${Math.round(sec / 3600)}시간 후 다시 채워짐`;
+}
+
+async function loadOpenAlexSettings(ctx) {
+  const target = ctx.$('#openalex-body');
+  if (!target) return;
+  let data;
+  try {
+    data = await ctx.api('/api/settings/openalex');
+  } catch (err) {
+    if (target.isConnected) target.innerHTML = `<p class="help">OpenAlex 설정을 불러오지 못했습니다: ${esc(err.message)}</p>`;
+    return;
+  }
+  if (target.isConnected) renderOpenAlexSettings(ctx, target, data || {});
+}
+
+// The key itself is never shown or prefilled; the server only reports whether one is stored and where it comes from.
+function renderOpenAlexSettings(ctx, target, data) {
+  const keyText = data.source === 'env'
+    ? '환경 변수 OPENALEX_API_KEY 사용 중'
+    : data.source === 'file' ? '저장된 키 사용 중' : (data.keyless_note || '키 없이 사용 중입니다. 검색 한도가 낮을 수 있습니다.');
+  const budget = data.budget;
+  const budgetLine = budget
+    ? `남은 하루 예산 ${fmtUsd(budget.remaining_usd)} / ${fmtUsd(budget.limit_usd)} · ${resetText(budget.reset_seconds)} · 확인 시각 ${fmtDate(budget.observed_at)}`
+    : '검색을 한 번 하면 표시됩니다.';
+  const freeUrl = typeof data.free_key_url === 'string' ? data.free_key_url : '';
+  const freeLink = freeUrl.startsWith('https://')
+    ? `<p class="help"><a href="${esc(freeUrl)}" target="_blank" rel="noopener noreferrer">무료 키 받기</a></p>`
+    : '';
+  target.innerHTML = `<p class="help">${esc(keyText)}</p>
+    <p class="help">${esc(budgetLine)}</p>
+    ${freeLink}
+    <form id="openalex-form" class="stack" autocomplete="off">
+      <div class="form-group"><label class="label" for="openalex-key">OpenAlex API 키 <span class="muted">${data.has_key ? '· 저장된 키 있음' : '· 없음'}</span></label><input id="openalex-key" type="password" maxlength="300" autocomplete="new-password" placeholder="새 키를 넣을 때만 입력"></div>
+      <label class="check-item"><input type="checkbox" id="openalex-clear"> 저장된 키 삭제</label>
+      <div class="actions"><button class="primary" type="submit">저장</button></div>
+    </form>`;
+  target.querySelector('#openalex-form').onsubmit = async e => {
+    e.preventDefault();
+    const keyInput = target.querySelector('#openalex-key');
+    const clear = target.querySelector('#openalex-clear').checked;
+    const key = keyInput.value.trim();
+    if (!key && !clear) { ctx.notify('저장할 키를 입력하거나 삭제를 고르세요.', 'error'); return; }
+    if (key && clear) { ctx.notify('키 입력과 삭제는 함께 할 수 없습니다. 하나만 고르세요.', 'error'); return; }
+    const button = e.target.querySelector('button[type=submit]');
+    button.disabled = true;
+    try {
+      await ctx.api('/api/settings/openalex', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(key ? {api_key: key} : {clear_key: true})});
+      keyInput.value = '';
+      ctx.notify(key ? 'OpenAlex 키를 저장했습니다.' : 'OpenAlex에 저장된 키를 삭제했습니다.');
+      await loadOpenAlexSettings(ctx);
+    } catch (err) {
+      ctx.error(err);
+      button.disabled = false;
     }
   };
 }
@@ -496,6 +613,7 @@ async function openThread(ctx, id) {
       if (reply) {
         await openThread(ctx, id);
         ctx.notify('답변을 저장했습니다. 초안이므로 원문과 대조하세요.');
+        await notifyRuntimeWarning(ctx);
       }
     } catch (err) {
       ctx.error(err);
@@ -660,6 +778,7 @@ async function gapAction(ctx, e) {
 // ---------- 자동 연구 ----------
 
 export async function showResearchLoop(ctx) {
+  stopRunPolling();
   await ctx.refreshLibrary().catch(() => {});
   ctx.$('#content').innerHTML = ctx.heading('자동 연구', '주제를 주면 문헌을 검색하고, 근거 카드를 만들고, 문제·방법·기여 초안을 단계별로 만듭니다. 각 반복이 끝나면 멈추고 사람이 검토합니다. 참신성은 판정하지 않습니다.') +
     '<div class="notice warning">자동 연구는 모델을 여러 번 호출하고 OpenAlex에서 제목·초록을 검색합니다. 시작 전에 보낼 내용을 확인합니다.</div>' +
@@ -667,9 +786,10 @@ export async function showResearchLoop(ctx) {
       <form id="run-form" class="stack">
         <div class="form-group"><label class="label" for="run-topic">연구 주제</label><textarea id="run-topic" maxlength="500" required placeholder="예: 소량 데이터에서 시계열 이상 탐지"></textarea></div>
         <details><summary class="help">시드 논문 고르기 <span class="muted">선택</span></summary><div style="margin-top:8px">${paperPicker(ctx, 'run-seed')}</div></details>
-        <div class="form-row">
+        <div class="form-row three">
           <div class="form-group"><label class="label" for="run-iter">반복 횟수</label><select id="run-iter"><option value="1">1회</option><option value="2">2회</option><option value="3">3회</option></select></div>
           <div class="form-group"><label class="label" for="run-per">반복당 논문 수 (3~10)</label><input id="run-per" type="number" min="3" max="10" value="5"></div>
+          <div class="form-group"><label class="label" for="run-minutes">실행 시간 예산(분) <span class="muted">5~240 · 검토 대기 제외</span></label><input id="run-minutes" type="number" min="5" max="240" step="1" value="45"></div>
         </div>
         <div class="actions"><button class="primary" type="submit">보낼 내용 확인 후 시작</button></div>
       </form></section>
@@ -694,14 +814,17 @@ async function startRun(ctx, form) {
   const topic = form.querySelector('#run-topic').value.trim();
   const perIteration = Number(form.querySelector('#run-per').value);
   const iterations = Number(form.querySelector('#run-iter').value);
+  const maxMinutes = Number(form.querySelector('#run-minutes').value);
   if (!topic) { ctx.notify('연구 주제를 입력하세요.', 'error'); return; }
   if (!Number.isInteger(perIteration) || perIteration < 3 || perIteration > 10) { ctx.notify('반복당 논문 수는 3~10 사이여야 합니다.', 'error'); return; }
+  if (!Number.isInteger(maxMinutes) || maxMinutes < 5 || maxMinutes > 240) { ctx.notify('실행 시간 예산은 5~240분 사이의 정수여야 합니다.', 'error'); return; }
   const body = {
     topic,
     project_id: ctx.state.projectId || null,
     seed_paper_ids: checkedValues(form, 'run-seed'),
     max_iterations: iterations,
     papers_per_iteration: perIteration,
+    max_run_minutes: maxMinutes,
   };
   ctx.notify('미리보기를 만드는 중입니다.');
   const preview = await ctx.post('/api/research-runs/preview', body);
@@ -736,22 +859,191 @@ async function loadRuns(ctx) {
   }
 }
 
+// ---------- 실행 조회 (백그라운드 단계 진행) ----------
+
+const RUN_POLL_MS = 2000;
+const STEP_STATUS_LABELS = {done: '완료', failed: '실패', running: '진행 중', cancelled: '취소됨'};
+const REF_KIND_LABELS = {P: '문제', M: '방법', C: '기여'};
+// Only one poller exists at a time. It is cleared when a different run is opened or the detail panel goes away.
+let runPollTimer = null;
+let runPollId = null;
+let detailSerial = 0;
+
+function stopRunPolling() {
+  if (runPollTimer) clearTimeout(runPollTimer);
+  runPollTimer = null;
+  runPollId = null;
+}
+
+const fmtElapsed = seconds => {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+};
+
+function runBudgetText(run) {
+  if (run?.stop_reason === 'time') return '실행 시간 예산을 다 썼습니다.';
+  if (run?.stop_reason === 'calls') return 'AI 호출 예산을 다 썼습니다.';
+  return '예산을 다 썼습니다.';
+}
+
+function runStatusLabel(run) {
+  if (run?.status === 'running' && !run.busy) return '멈춤 · 다시 실행 가능';
+  return RUN_STATUS_LABELS[run?.status] || run?.status || '';
+}
+
+// One line of plain text (escaped by the caller). Busy runs start with "진행 중".
+export function runProgressText(run = {}) {
+  const stage = STAGES.find(([key]) => key === run.stage)?.[1] || (run.stage ? String(run.stage) : '');
+  const config = run.config || {};
+  const maxSeconds = Number(run.max_run_seconds ?? config.max_run_seconds);
+  const maxCalls = Number(run.max_llm_calls ?? config.max_llm_calls);
+  const parts = [];
+  if (run.busy) parts.push(`진행 중: ${stage || '준비 중'}`);
+  else if (stage && run.status !== 'ready') parts.push(`마지막 단계: ${stage}`);
+  if (run.elapsed_seconds != null) {
+    parts.push(`경과 ${fmtElapsed(run.elapsed_seconds)}${Number.isFinite(maxSeconds) && maxSeconds > 0 ? ` / 예산 ${Math.round(maxSeconds / 60)}분` : ''}`);
+  }
+  if (run.llm_calls != null) {
+    parts.push(`AI 호출 ${run.llm_calls}${Number.isFinite(maxCalls) && maxCalls > 0 ? `/${maxCalls}` : ''}`);
+  }
+  return parts.join(' · ');
+}
+
+function runFinishedNotice(run) {
+  switch (run.status) {
+    case 'awaiting_review': return {text: '검토 지점에 도착했습니다. 자기 점검과 약점을 보고 방향을 정하세요.', kind: 'notice'};
+    case 'completed': return {text: '연구 실행을 마쳤습니다.', kind: 'notice'};
+    case 'budget_exhausted': return {text: runBudgetText(run), kind: 'warning'};
+    case 'cancelled': return {text: '실행을 중단했습니다. 지금까지의 단계 기록은 남아 있습니다.', kind: 'notice'};
+    case 'failed_step': return {text: '단계가 실패했습니다. 원문 응답과 시도 기록을 확인한 뒤 다시 실행하세요.', kind: 'error'};
+    case 'failed': return {text: '실행이 실패했습니다. 단계 기록을 확인하세요.', kind: 'error'};
+    default: return {text: '실행이 멈췄습니다. 다시 실행할 수 있습니다.', kind: 'notice'};
+  }
+}
+
+function startRunPolling(ctx, id) {
+  stopRunPolling();
+  const runId = String(id);
+  runPollId = runId;
+  const poll = async () => {
+    runPollTimer = null;
+    const current = ctx.$('#run-detail');
+    if (runPollId !== runId || !current || current.dataset.runId !== runId) { stopRunPolling(); return; }
+    let data;
+    try {
+      data = await ctx.api(`/api/research-runs/${enc(runId)}`);
+    } catch (err) {
+      stopRunPolling();
+      ctx.error(err);
+      return;
+    }
+    const target = ctx.$('#run-detail');
+    if (runPollId !== runId || !target || target.dataset.runId !== runId) { stopRunPolling(); return; }
+    const run = data.run ?? data;
+    target.innerHTML = runDetailHtml(ctx, data);
+    if (run.busy) {
+      runPollTimer = setTimeout(poll, RUN_POLL_MS);
+      return;
+    }
+    stopRunPolling();
+    const notice = runFinishedNotice(run);
+    ctx.notify(notice.text, notice.kind);
+    loadRuns(ctx).catch(() => {});
+  };
+  runPollTimer = setTimeout(poll, RUN_POLL_MS);
+}
+
 async function showRunDetail(ctx, id) {
   const target = ctx.$('#run-detail');
   if (!target) return;
+  stopRunPolling();
+  const serial = ++detailSerial;
   target.innerHTML = '<p class="help">실행 정보를 불러오는 중입니다.</p>';
   const data = await ctx.api(`/api/research-runs/${enc(id)}`);
-  target.dataset.runId = id;
+  if (serial !== detailSerial || !target.isConnected) return;
+  target.dataset.runId = String(id);
   target.innerHTML = runDetailHtml(ctx, data);
+  if ((data.run ?? data).busy) startRunPolling(ctx, id);
 }
 
 const textList = list => arr(list).map(item => `<li>${esc(textOf(item))}</li>`).join('');
+
+function stepOutput(step) {
+  const raw = step?.output;
+  if (raw && typeof raw === 'object') return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
+  }
+  return {};
+}
+
+// ---------- 자기 점검 ----------
+
+export const CHECK_FLAG_LABELS = {
+  single_source: '근거 논문 1편뿐',
+  inherited_evidence: '근거를 문제에서 이어받음',
+  no_prior_found: '가까운 선행 연구를 못 찾음',
+  prior_search_failed: '선행 연구 검색 실패',
+  high_prior_overlap: '선행 연구와 많이 겹침 · 직접 확인 필요',
+};
+
+const countOf = value => (Array.isArray(value) ? value.length : (Number.isFinite(Number(value)) ? Number(value) : 0));
+const flagChips = flags => arr(flags).map(f => `<span class="check-flag">${esc(CHECK_FLAG_LABELS[f] || f)}</span>`).join(' ');
+
+function critiqueRefChip(ref, evidenceById) {
+  const raw = String(ref ?? '');
+  const key = raw.trim().toUpperCase();
+  const match = /^([PMCE])(\d+)$/.exec(key);
+  if (!match) return `<span class="chip">${esc(raw)}</span>`;
+  if (match[1] === 'E') {
+    const ev = evidenceById.get(key);
+    return `<span class="chip evidence-chip" tabindex="0" title="${esc(ev?.quote || '연결된 근거 구절이 없습니다')}">${esc(key)}${ev?.title ? ` · ${esc(short(String(ev.title), 30))}` : ''}</span>`;
+  }
+  return `<span class="chip">${esc(REF_KIND_LABELS[match[1]])} #${esc(Number(match[2]))}</span>`;
+}
+
+// Renders critique.note, weaknesses with ref chips, code-computed checks, and legacy scores.
+// Works for both the current format (no scores) and older runs (scores object, string weaknesses).
+function critiqueHtml(critique, evidenceById) {
+  const checks = critique.checks && typeof critique.checks === 'object' ? critique.checks : {};
+  const weaknesses = arr(critique.weaknesses).map(w => ({text: textOf(w), refs: w && typeof w === 'object' ? arr(w.refs) : []}));
+  const nextQueries = arr(critique.next_queries);
+  const scores = critique.scores && typeof critique.scores === 'object' ? Object.entries(critique.scores) : [];
+  const dropped = countOf(critique.dropped_uncited);
+  const summary = checks.summary && typeof checks.summary === 'object' ? Object.entries(checks.summary).filter(([, n]) => Number(n) > 0) : [];
+  const weaknessHtml = weaknesses.length
+    ? `<ol class="critique-list">${weaknesses.map(w => `<li><span>${esc(w.text)}</span>${w.refs.length ? `<div class="chip-row">${w.refs.map(r => critiqueRefChip(r, evidenceById)).join('')}</div>` : ''}</li>`).join('')}</ol>`
+    : '<p class="help">인용이 붙은 약점이 없습니다.</p>';
+  const problemRows = arr(checks.problems).map(p => `<li><span class="pill">${esc(p?.key || '')}</span> ${esc(short(String(p?.title ?? ''), 80))} <span class="section-caption">근거 ${esc(countOf(p?.evidence_count))}건 · 논문 ${esc(countOf(p?.source_papers))}편${countOf(p?.seed_evidence) ? ` · 시드 근거 ${esc(countOf(p.seed_evidence))}` : ''}</span> ${flagChips(p?.flags)}</li>`).join('');
+  const methodRows = arr(checks.methods).map(m => `<li><span class="pill">${esc(m?.key || '')}</span>${m?.problem != null ? ` 문제 ${esc(m.problem)}` : ''} ${flagChips(m?.flags)}${m?.evidence_inherited && !arr(m?.flags).includes('inherited_evidence') ? ' <span class="check-flag">근거를 문제에서 이어받음</span>' : ''}</li>`).join('');
+  const contributionRows = arr(checks.contributions).map(c => `<li><span class="pill">${esc(c?.key || '')}</span> 가까운 선행 연구 ${esc(countOf(c?.closest_prior_count))}편${c?.prior_overlap_label ? ` · 단어 겹침 ${esc(c.prior_overlap_label)}` : ''} ${flagChips(c?.flags)}</li>`).join('');
+  const checkBlock = (title, rows) => (rows ? `<div class="info-block"><h3>${esc(title)}</h3><ul class="critique-list">${rows}</ul></div>` : '');
+  const summaryHtml = summary.length ? `<p class="help">점검 요약: ${summary.map(([flag, n]) => `${esc(CHECK_FLAG_LABELS[flag] || flag)} ${esc(n)}개`).join(' · ')}</p>` : '';
+  const legacy = scores.length ? `<div class="info-block"><h3>이전 형식 점수(참고용)</h3><ul class="critique-list">${scores.map(([k, v]) => `<li>${esc(k)}: ${esc(v)}</li>`).join('')}</ul></div>` : '';
+  return `<section class="card card-pad" style="margin-top:16px" data-critique>
+      <h2 class="section-title">자기 점검 (같은 모델)</h2>
+      <p class="help">${esc(critique.note || '같은 모델이 쓴 자기 점검입니다. 참신성을 판정하지 않으므로 원문과 선행 연구를 직접 확인하세요.')}</p>
+      ${dropped > 0 ? `<div class="notice warning">인용 없는 약점 ${esc(dropped)}개는 제외했습니다.</div>` : ''}
+      <div class="info-block"><h3>약점</h3>${weaknessHtml}</div>
+      ${nextQueries.length ? `<div class="info-block"><h3>다음 검색어</h3><ul class="critique-list">${nextQueries.map(q => `<li>${esc(textOf(q))}</li>`).join('')}</ul></div>` : ''}
+      ${checkBlock('문제 점검', problemRows)}
+      ${checkBlock('방법 점검', methodRows)}
+      ${checkBlock('기여 점검', contributionRows)}
+      ${summaryHtml}${legacy}
+    </section>`;
+}
+
+// ---------- 실행 상세 ----------
 
 function runDetailHtml(ctx, data) {
   const run = data.run ?? data;
   const steps = arr(data.steps ?? run.steps, 'steps');
   const state = data.state ?? run.state ?? {};
   const status = run.status || '';
+  const busy = !!run.busy;
   const terminal = RUN_TERMINAL.includes(status);
   const reviewing = status === 'awaiting_review';
   const problems = arr(state.problems);
@@ -759,9 +1051,8 @@ function runDetailHtml(ctx, data) {
   const contributions = arr(state.contributions);
   const evidence = arr(state.evidence);
   const candidates = arr(state.candidates);
-  const critique = state.critique || {};
+  const hasCritique = !!state.critique && typeof state.critique === 'object';
   const evidenceById = new Map(evidence.map(e => [String(e.key ?? e.id), e]));
-  const scores = critique.scores && typeof critique.scores === 'object' ? Object.entries(critique.scores) : [];
   const lastByStage = new Map();
   const iteration = run.iteration ?? state.iteration;
   for (const s of steps) if (iteration === undefined || s.iteration === iteration) lastByStage.set(s.stage, s);
@@ -770,16 +1061,17 @@ function runDetailHtml(ctx, data) {
     const cls = !last ? 'pending' : last.status === 'failed' ? 'failed' : last.status === 'running' ? 'running' : 'done';
     return `<li class="step ${cls}"><span class="step-dot" aria-hidden="true"></span>${esc(label)}</li>`;
   }).join('');
+  const progress = runProgressText(run);
+  const notices = [status === 'budget_exhausted' ? runBudgetText(run) : '', run.runtime_warning || '']
+    .filter(Boolean).map(text => `<div class="notice warning">${esc(text)}</div>`).join('');
   const controls = `<div class="toolbar">
-      <button type="button" class="secondary" data-run-step ${terminal || reviewing ? 'disabled' : ''}>다음 단계</button>
-      <button type="button" class="secondary" data-run-advance ${terminal || reviewing ? 'disabled' : ''}>검토 지점까지 실행</button>
+      <button type="button" class="secondary" data-run-step ${terminal || reviewing || busy ? 'disabled' : ''}>다음 단계</button>
+      <button type="button" class="secondary" data-run-advance ${terminal || reviewing || busy ? 'disabled' : ''}>검토 지점까지 실행</button>
       <button type="button" class="danger" data-run-cancel ${terminal ? 'disabled' : ''}>중단</button></div>`;
-  const review = reviewing ? `<div class="notice warning"><strong>검토 지점입니다.</strong> 점수와 약점을 보고 방향을 정하세요. 점수는 모델의 자체 평가이며 참신성을 판정하지 않습니다.</div>
-      <div class="info-block"><h3>비판 점수</h3>${scores.length ? `<ul>${scores.map(([k, v]) => `<li>${esc(k)}: ${esc(v)}</li>`).join('')}</ul>` : '<p class="help">점수가 없습니다.</p>'}
-      <h3>약점</h3>${arr(critique.weaknesses).length ? `<ul>${textList(critique.weaknesses)}</ul>` : '<p class="help">기록된 약점이 없습니다.</p>'}</div>
+  const review = reviewing ? `<div class="notice warning"><strong>검토 지점입니다.</strong> 아래 자기 점검과 약점을 보고 방향을 정하세요. 자기 점검은 같은 모델이 쓴 평가이며 참신성을 판정하지 않습니다.</div>
       <div class="form-group"><label class="label" for="run-feedback">검토 메모 <span class="muted">선택</span></label><textarea id="run-feedback" maxlength="2000"></textarea></div>
       <div class="form-group"><label class="label" for="run-focus">집중할 문제</label><select id="run-focus"><option value="">지정 안 함</option>${problems.map((p, i) => `<option value="${i}">#${i + 1} ${esc(short(textOf(p), 60))}</option>`).join('')}</select></div>
-      <div class="actions"><button type="button" class="primary" data-run-feedback>다음 반복으로 진행</button></div>` : '';
+      <div class="actions"><button type="button" class="primary" data-run-feedback ${busy ? 'disabled' : ''}>다음 반복으로 진행</button></div>` : '';
   const evidenceHtml = evidence.length ? evidence.map(e => `<div class="evidence"><strong>${esc(e.key ?? e.id)}</strong> · ${esc(e.title || '제목 없음')}${e.year ? ` · ${esc(e.year)}` : ''}${e.quote ? `<blockquote>${esc(e.quote)}</blockquote>` : ''}</div>`).join('') : '<p class="help">근거 카드가 없습니다.</p>';
   const problemsHtml = problems.length ? problems.map((p, i) => {
     const chips = arr(p.evidence).map(id => {
@@ -788,10 +1080,17 @@ function runDetailHtml(ctx, data) {
     }).join(' ') || '<span class="section-caption">근거 없음</span>';
     return `<div class="result"><span class="pill">#${i + 1}</span> ${p.type ? `<span class="pill">${esc(p.type)}</span>` : ''}<p><strong>${esc(textOf(p))}</strong></p>${p.why_open ? `<p>${esc(p.why_open)}</p>` : ''}<div class="chip-row">${chips}</div></div>`;
   }).join('') : '<p class="help">문제 후보가 없습니다.</p>';
-  const methodsHtml = methods.length ? `<ul>${methods.map(m => { const pi = m.problem_index ?? m.problem; return `<li>${pi !== undefined && pi !== null ? `<span class="pill">문제 #${esc(Number(pi) + 1)}</span> ` : ''}<strong>${esc(textOf(m))}</strong>${m.idea && m.idea !== textOf(m) ? `<p>${esc(m.idea)}</p>` : ''}${m.expected_gain ? `<p class="help">기대 효과: ${esc(m.expected_gain)}</p>` : ''}${m.risks ? `<p class="help">위험: ${esc(m.risks)}</p>` : ''}</li>`; }).join('')}</ul>` : '<p class="help">방법 제안이 없습니다.</p>';
+  const methodsHtml = methods.length ? `<ul>${methods.map(m => {
+    const item = m && typeof m === 'object' ? m : {};
+    const pi = item.problem_index ?? item.problem;
+    return `<li>${pi !== undefined && pi !== null ? `<span class="pill">문제 #${esc(Number(pi) + 1)}</span> ` : ''}${item.evidence_inherited ? '<span class="pill">근거 이어받음</span> ' : ''}<strong>${esc(textOf(m))}</strong>${item.idea && item.idea !== textOf(m) ? `<p>${esc(item.idea)}</p>` : ''}${item.expected_gain ? `<p class="help">기대 효과: ${esc(item.expected_gain)}</p>` : ''}${item.risks ? `<p class="help">위험: ${esc(item.risks)}</p>` : ''}</li>`;
+  }).join('')}</ul>` : '<p class="help">방법 제안이 없습니다.</p>';
   const contributionsHtml = contributions.length ? contributions.map((c, i) => {
-    const nearest = arr(c.closest_prior ?? c.nearest ?? c.nearest_prior ?? c.prior_work);
+    const item = c && typeof c === 'object' ? c : {};
+    const nearest = arr(item.closest_prior ?? item.nearest ?? item.nearest_prior ?? item.prior_work);
     return `<div class="result"><p><span class="pill">#${i + 1}</span> <strong>${esc(textOf(c))}</strong></p>
+      ${item.search_query ? `<p class="help">선행 연구 검색어: ${esc(item.search_query)}</p>` : ''}
+      ${item.prior_overlap_label ? `<p class="help">선행 연구와 단어 겹침: ${esc(item.prior_overlap_label)}</p>` : ''}
       <p class="help">가장 가까운 선행 연구 (검색 결과일 뿐입니다. 참신성은 판정하지 않습니다.)</p>
       ${nearest.length ? `<ul>${nearest.map(n => `<li>${esc(n.title || '제목 없음')}${n.year ? ` · ${esc(n.year)}` : ''}${/^https?:\/\//.test(String(n.url || '')) ? ` · <a href="${esc(n.url)}" target="_blank" rel="noopener noreferrer">원문</a>` : ''}</li>`).join('')}</ul>` : '<p class="help">가까운 선행 연구를 찾지 못했습니다.</p>'}</div>`;
   }).join('') : '<p class="help">기여 초안이 없습니다.</p>';
@@ -801,10 +1100,19 @@ function runDetailHtml(ctx, data) {
       ${contributions.map((c, i) => `<label class="check-item"><input type="checkbox" name="run-save-contribution" value="${i}"><span>기여 #${i + 1}: ${esc(short(textOf(c), 120))}</span></label>`).join('')}</div>
       <div class="actions"><button type="button" class="primary" data-run-save ${ctx.state.projectId ? '' : 'disabled'}>선택 항목 저장</button></div>
       <p class="help">저장하면 아이디어와 갭 후보로 기록됩니다. 확정 전까지 초안입니다.</p></section>` : '';
-  const stepRows = steps.length ? steps.map(s => `<tr><td>${esc((STAGES.find(([k]) => k === s.stage) || [s.stage, s.stage])[1])}</td><td>${esc(s.status || '')}</td><td>${esc(s.model || '-')}</td><td>${esc(s.error || '')}</td></tr>`).join('') : '<tr><td colspan="4">기록이 없습니다.</td></tr>';
+  const stepRows = steps.length ? steps.map(s => {
+    const out = stepOutput(s);
+    const attempts = Array.isArray(out.attempts) ? out.attempts.length : 0;
+    const notes = [attempts > 1 ? `시도 ${attempts}회` : '', out.replayed_from_step != null ? '저장된 응답 재사용' : ''].filter(Boolean);
+    const raw = typeof out.raw_response === 'string' ? out.raw_response : '';
+    const rawHtml = raw ? `<details><summary>AI 원문 보기</summary><pre class="raw-output">${esc(raw.slice(0, 4000))}</pre>${raw.length > 4000 ? '<p class="help">앞 4,000자만 표시합니다.</p>' : ''}${out.raw_truncated ? '<p class="help">저장 단계에서 잘린 응답입니다.</p>' : ''}</details>` : '';
+    return `<tr><td>${esc((STAGES.find(([k]) => k === s.stage) || [s.stage, s.stage])[1])}</td><td>${esc(STEP_STATUS_LABELS[s.status] || s.status || '')}${notes.length ? `<br><span class="section-caption">${esc(notes.join(' · '))}</span>` : ''}</td><td>${esc(s.model || '-')}</td><td>${esc(s.error || '')}${rawHtml}</td></tr>`;
+  }).join('') : '<tr><td colspan="4">기록이 없습니다.</td></tr>';
   return `<section class="card card-pad" data-run-status="${esc(status)}">
       <div class="thread-head"><div><h2 class="section-title">${esc(short(run.topic, 200))}</h2>
-      <p class="help"><span class="pill">${esc(RUN_STATUS_LABELS[status] || status)}</span> · 반복 ${esc(run.iteration ?? state.iteration ?? '-')}/${esc(run.max_iterations ?? run.config?.max_iterations ?? '-')} · ${esc(fmtDate(run.created_at))}</p></div></div>
+      <p class="help"><span class="pill">${esc(runStatusLabel(run))}</span> · 반복 ${esc(run.iteration ?? state.iteration ?? '-')}/${esc(run.max_iterations ?? run.config?.max_iterations ?? '-')} · ${esc(fmtDate(run.created_at))}</p>
+      ${progress ? `<p class="run-progress" data-run-progress>${esc(progress)}</p>` : ''}</div></div>
+      ${notices}
       <ol class="stepper" aria-label="단계">${stepper}</ol>
       ${controls}${review}</section>
     <section class="card card-pad" style="margin-top:16px"><h2 class="section-title">근거 카드</h2>${evidenceHtml}</section>
@@ -812,6 +1120,7 @@ function runDetailHtml(ctx, data) {
     <section class="card card-pad" style="margin-top:16px"><h2 class="section-title">문제 후보</h2>${problemsHtml}</section>
     <section class="card card-pad" style="margin-top:16px"><h2 class="section-title">방법 개선안</h2>${methodsHtml}</section>
     <section class="card card-pad" style="margin-top:16px"><h2 class="section-title">기여 초안</h2>${contributionsHtml}</section>
+    ${hasCritique ? critiqueHtml(state.critique, evidenceById) : ''}
     ${saveCandidates ? `<div style="margin-top:16px">${saveCandidates}</div>` : ''}
     <section class="card card-pad" style="margin-top:16px"><h2 class="section-title">단계 기록</h2>
       <div class="table-wrap"><table class="step-table"><thead><tr><th>단계</th><th>상태</th><th>모델</th><th>오류</th></tr></thead><tbody>${stepRows}</tbody></table></div></section>`;
@@ -1070,6 +1379,7 @@ export async function renderPaperProfileSection(container, paper, ctx) {
         const result = await sendWithPreview(ctx, `/api/papers/${enc(paperId)}/profile/ai/preview`, `/api/papers/${enc(paperId)}/profile/ai`, {}, {busyText: 'AI가 논문을 정리하는 중입니다. 로컬 모델은 1~2분 걸릴 수 있습니다.'});
         if (result === null) return;
         ctx.notify('AI로 정리했습니다. 초안이므로 원문과 대조하세요.');
+        await notifyRuntimeWarning(ctx);
       } else if (target.hasAttribute('data-profile-confirm')) {
         await ctx.api(`/api/profiles/${enc(target.dataset.profileConfirm)}`, asBody({status: 'confirmed'}));
         ctx.notify('정리를 확정했습니다.');

@@ -22,6 +22,15 @@
   - 아직 안 된 것: llama3-ko로는 AI 프로필이 시간 초과나 빈 항목으로 끝나, 더 나은 모델로 다시 확인해야 한다. 외부 무료 제공자와 OpenAlex 인용 연결, MCP 도구의 실제 클라이언트 연결은 모의 테스트만 했다.
   - 세부 기록은 [ExecPlan 004](exec-plans/active/004-research-assistant.md)에, 조사 근거는 [docs/research](research/auto-research-landscape.md)에 있다.
 
+- 2026-11-10: 연구 루프 실행을 안정화했다 ([ExecPlan 005](exec-plans/completed/005-research-runtime-hardening.md), 근거는 [오케스트레이션 검증](research/orchestration-review.md)).
+  - 실행 방식: 백그라운드 실행, 실행별 잠금, 즉시 취소. Ollama는 스트리밍으로 받아 다음 줄에서 멈춘다.
+  - 오류 처리: 재시도 상한, 원시 응답 저장과 중단 단계 재사용, 실행 시간 예산.
+  - 자기 점검: 인용 필수 약점과 코드 점검으로 바꾸고 점수를 없앴다. 기여의 선행 연구는 영어 검색어로 찾는다.
+  - 로컬 모델 GPU/CPU 확인, 입력 크기별 `num_ctx`.
+  - OpenAlex 키 설정, 남은 예산 표시, 검색 캐시.
+  - 실제 확인: 로컬 llama3-ko(GPU 94%)로 1회 반복이 34초에 끝났고, 실제 취소는 1.1초 만에 멈췄다. 실제 OpenAlex 예산 헤더도 표시했다.
+  - 한계: 프롬프트 처리 중에는 첫 토큰이 나올 때까지 취소가 늦을 수 있다. `num_ctx` 구간이 바뀌면 모델을 다시 올린다(약 2초).
+
 ## 현재 동작
 
 - 단일 사용자 로컬 웹앱: 프로젝트 생성, PDF 등록·해시 기반 중복 처리, PDF 없는 검색 논문에 PDF 연결, 읽기 상태·마지막 앱 페이지 기록.

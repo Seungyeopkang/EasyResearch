@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations, reading_library, categories, search_import, ai_routes, knowledge, research_agent
+from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations, reading_library, categories, search_import, ai_routes, knowledge, research_agent, openalex_routes
 from .pdf_processing import locate_quote
 
 app = FastAPI(title="EasyResearch", version="0.1.0", description="로컬 연구 자료와 페이지 근거를 관리하는 API")
@@ -31,6 +31,7 @@ app.include_router(search_import.router)
 app.include_router(ai_routes.router)
 app.include_router(knowledge.router)
 app.include_router(research_agent.router)
+app.include_router(openalex_routes.router)
 WEB = storage.ROOT / "apps" / "web"
 # Windows may register .mjs as text/plain, which browsers refuse as a module.
 mimetypes.add_type("text/javascript", ".mjs", strict=True)
@@ -649,7 +650,7 @@ def search(q: str, source: str = "openalex", project_id: Optional[str] = None):
         raise HTTPException(422, "검색 소스가 올바르지 않습니다.")
     try:
         if source == "openalex":
-            results = scholarly.search_openalex(q, api_key=os.environ.get("OPENALEX_API_KEY"))
+            results = scholarly.search_openalex(q, api_key=scholarly.openalex_key())
         elif source == "arxiv":
             results = scholarly.search_arxiv(q)
         else:

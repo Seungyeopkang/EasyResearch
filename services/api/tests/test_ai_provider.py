@@ -20,6 +20,22 @@ EXTERNAL = {"provider": "openai_compatible", "base_url": "https://example.test/v
 SECRET = "sk-test-SECRET-value-123"
 
 
+class FakeStream:
+    """Stands in for the urlopen() response of an Ollama NDJSON stream."""
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+        self.reads = 0
+        self.closed = False
+
+    def readline(self):
+        self.reads += 1
+        return self.lines.pop(0) if self.lines else b""
+
+    def close(self):
+        self.closed = True
+
+
 class ProviderTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -31,9 +47,15 @@ class ProviderTests(unittest.TestCase):
         self.sent = []
         self.original = llm.transport
         llm.transport = lambda config, messages, **kw: (self.sent.append((config, messages, kw)) or "OK")
+        # Never let a test reach the real local Ollama (the user may be running a GPU job).
+        self.probe_calls = []
+        self.original_probe = llm.runtime_probe
+        llm.runtime_probe = lambda base_url: (self.probe_calls.append(base_url) or
+                                              [{"name": "fake:latest", "size": 1000, "size_vram": 1000}])
 
     def tearDown(self):
         llm.transport = self.original
+        llm.runtime_probe = self.original_probe
         self.client.__exit__(None, None, None)
         self.env.stop()
         self.temp.cleanup()
@@ -115,17 +137,60 @@ class ProviderTests(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(captured["body"]))
 
     def test_ollama_uses_native_chat_endpoint(self):
+        # Ollama streams NDJSON: content lines, then a done line that carries stats.
+        stream = FakeStream([
+            b'{"message": {"role": "assistant", "content": "{\\"a\\": "}, "done": false}\n',
+            b'{"message": {"role": "assistant", "content": "1}"}, "done": false}\n',
+            b'{"done": true, "prompt_eval_count": 5, "eval_count": 7, "total_duration": 2000000000}\n',
+        ])
         captured = {}
-        def fake_post(url, body, headers, timeout):
-            captured.update(url=url, body=body)
-            return {"message": {"content": "{\"a\": 1}"}}
+
+        def fake_urlopen(request, timeout=None):
+            captured.update(url=request.full_url, body=json.loads(request.data.decode("utf-8")), timeout=timeout)
+            return stream
+
         llm.transport = self.original
         self.put(LOCAL)
-        with patch.object(llm, "_post", fake_post):
+        with patch.object(llm, "urlopen", fake_urlopen):
             result = llm.complete_json([{"role": "user", "content": "x"}], purpose="t")
         self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertIs(captured["body"]["stream"], True)
         self.assertEqual(captured["body"]["format"], "json")
+        self.assertIn(captured["body"]["options"]["num_ctx"], llm.NUM_CTX_BUCKETS)  # AC9
         self.assertEqual(result["data"], {"a": 1})
+        self.assertEqual(result["stats"]["eval_count"], 7)
+        self.assertEqual(result["stats"]["num_ctx"], captured["body"]["options"]["num_ctx"])
+        self.assertTrue(stream.closed)
+
+    def test_status_route_reports_runtime_for_local_ollama(self):
+        self.put(LOCAL)
+        status = self.client.get("/api/ai/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        body = status.json()
+        self.assertEqual(body["provider"], "ollama")
+        self.assertEqual(body["runtime"]["applicable"], True)
+        self.assertEqual(body["runtime"]["reachable"], True)
+        self.assertEqual(body["runtime"]["configured_gpu_percent"], 100)
+        self.assertIsNone(body["runtime"]["warning"])
+        self.assertEqual(self.probe_calls, ["http://127.0.0.1:11434"])
+
+    def test_status_route_never_probes_remote_or_other_providers(self):  # AC8
+        self.put(EXTERNAL)
+        body = self.client.get("/api/ai/status").json()
+        self.assertEqual(body["runtime"]["applicable"], False)
+        self.put({**LOCAL, "base_url": "https://ollama.example.test"})  # Ollama name, remote host
+        body = self.client.get("/api/ai/status").json()
+        self.assertEqual(body["runtime"]["applicable"], False)
+        self.assertEqual(self.probe_calls, [])
+
+    def test_ai_test_route_includes_runtime_and_warning(self):  # AC8
+        llm.runtime_probe = lambda base_url: [{"name": "fake:latest", "size": 1000, "size_vram": 0}]
+        self.put(LOCAL)
+        result = self.client.post("/api/ai/test", json={}, headers=self.h)
+        self.assertEqual(result.status_code, 200, result.text)
+        runtime = result.json()["runtime"]
+        self.assertEqual(runtime["configured_gpu_percent"], 0)
+        self.assertIn("CPU", runtime["warning"])
 
     def test_config_validation(self):
         self.assertEqual(self.put({"provider": "weird"}).status_code, 422)

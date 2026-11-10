@@ -146,6 +146,31 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
     assert.doesNotMatch(captured, /<img src=x>/);
   }
 
+  // runProgressText (AC12): a busy run names the stage, elapsed time against the budget, and the AI call count.
+  {
+    const busy = r.runProgressText({busy: true, status: 'running', stage: 'search', elapsed_seconds: 83,
+      max_run_seconds: 2700, llm_calls: 3, max_llm_calls: 40, config: {}});
+    assert.match(busy, /진행 중/);
+    assert.match(busy, /문헌 검색/);
+    assert.match(busy, /1:23/);
+    assert.match(busy, /예산 45분/);
+    assert.match(busy, /AI 호출 3\/40/);
+    // The budget may come from config when the view omits max_run_seconds (runs saved before this change).
+    const fromConfig = r.runProgressText({busy: true, status: 'running', stage: 'search', elapsed_seconds: 5,
+      llm_calls: 0, config: {max_run_seconds: 2700}});
+    assert.match(fromConfig, /예산 45분/);
+    // A run that is not busy is not shown as in progress.
+    const idle = r.runProgressText({busy: false, status: 'awaiting_review', stage: null, elapsed_seconds: 83,
+      max_run_seconds: 2700, llm_calls: 3, max_llm_calls: 40});
+    assert.doesNotMatch(idle, /진행 중/);
+    assert.match(idle, /AI 호출 3\/40/);
+  }
+
+  // CHECK_FLAG_LABELS has exactly the five documented self-check flags (AC7).
+  assert.deepEqual(Object.keys(r.CHECK_FLAG_LABELS).sort(),
+    ['high_prior_overlap', 'inherited_evidence', 'no_prior_found', 'prior_search_failed', 'single_source']);
+  for (const label of Object.values(r.CHECK_FLAG_LABELS)) assert.equal(typeof label, 'string');
+
   console.log('research_ui ok');
 })().catch(error => {
   console.error(error);

@@ -35,7 +35,7 @@ Help the user move from a topic to candidate problems, method improvements, and 
 4. **problems**: list candidate open problems. Each one cites evidence ids (E1, E2, ...), gives a type (a gap type from the gap-finder skill), and says why it is still open.
 5. **methods**: for the top 1 to 3 problems, propose method changes. Each change says what it modifies and which evidence supports it.
 6. **contributions**: draft contribution statements. For each, name the closest prior work in the library. Do not judge novelty.
-7. **critique**: review the contributions as a skeptical reviewer. List weaknesses, missing evidence, and the next query to run.
+7. **critique**: a cited self-check. List weaknesses; each weakness must cite at least one key (P1 for a problem, M1 for a method, C1 for a contribution, E2 for evidence). Weaknesses without a valid key are dropped. The check gives no scores and does not judge novelty. Its structural checks (single-source problems, inherited evidence, prior-work overlap) are computed by code, and the note says so.
 
 ## Human checkpoint
 
@@ -63,7 +63,7 @@ Stop after **critique**. Show the user the problems, methods, contributions, and
 
 ## App run status
 
-To check an app run, call `list_research_runs()`, then `get_research_run(run_id)`. Report the status, the current stage, and whether the run is waiting for review. Do not start or advance a run through MCP; the app and the user control that.
+To check an app run, call `list_research_runs()`, then `get_research_run(run_id)`. Report the status, the current stage, and whether the run is waiting for review. The app runs steps in the background: after the user starts or advances a run, poll `get_research_run(run_id)` until `busy` is false, then report the result. A run with status `running` and `busy` false has stopped and can be started again. Do not start, advance, or cancel a run through MCP; the app and the user control that.
 
 ## Example
 

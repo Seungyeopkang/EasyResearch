@@ -1,4 +1,4 @@
-"""AI provider settings and shared helpers for AI endpoints."""
+"""AI provider settings, local runtime status, and shared helpers for AI endpoints."""
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -26,6 +26,8 @@ class AITestRequest(BaseModel):
 
 
 def llm_http_error(exc: "llm.LLMError") -> HTTPException:
+    if exc.code == "stopped":
+        return HTTPException(409, {"code": exc.code, "message": exc.message})
     status = exc.status if exc.status in (409, 429) else 400 if exc.code == "not_configured" else 502
     return HTTPException(status, {"code": exc.code, "message": exc.message})
 
@@ -43,6 +45,12 @@ def run_llm(call):
 @router.get("/api/ai/config")
 def get_ai_config():
     return {**llm.public_config(), "presets": llm.PRESETS}
+
+
+@router.get("/api/ai/status")
+def get_ai_status():
+    cfg = llm.get_config()
+    return {"provider": cfg["provider"], "model": cfg["model"], "runtime": llm.runtime_status(cfg)}
 
 
 @router.put("/api/ai/config")
@@ -66,4 +74,5 @@ def preview_ai_test():
 @router.post("/api/ai/test")
 def ai_test(payload: AITestRequest):
     result = run_llm(lambda: llm.complete(TEST_MESSAGES, purpose="연결 확인", preview_hash=payload.preview_hash, max_tokens=20))
-    return {"ok": True, "reply": result["text"][:200], "model": result["model"], "provider": result["provider"]}
+    return {"ok": True, "reply": result["text"][:200], "model": result["model"], "provider": result["provider"],
+            "runtime": llm.runtime_status()}

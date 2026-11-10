@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app import llm, scholarly, storage
+from app import llm, research_agent, scholarly, storage
 from app.main import app
 
 ABSTRACT = ("Image segmentation models are accurate on benchmarks. Boundary accuracy remains limited on small objects. "
@@ -37,7 +38,7 @@ class FakeLLM:
 
     @staticmethod
     def stage_of(system):
-        if '"scores"' in system:
+        if '"weaknesses"' in system:  # the critique prompt names this key; it has no "scores" any more
             return "critique"
         if '"contributions"' in system:
             return "contributions"
@@ -79,11 +80,12 @@ class FakeLLM:
                  "evidence": ["E1"]},
             ]})
         if stage == "contributions":
-            return json.dumps({"contributions": [{"statement": "작은 객체 경계 정확도 평가"},
-                                                 "도시 외 장면으로 일반화 검증"]})
+            return json.dumps({"contributions": [
+                {"statement": "작은 객체 경계 정확도 평가", "search_query": "small object boundary accuracy evaluation"},
+                {"statement": "도시 외 장면으로 일반화 검증", "search_query": "generalization beyond urban scenes segmentation"}]})
         if stage == "critique":
-            return json.dumps({"scores": {"novelty": 4.2, "feasibility": 3, "evidence": 9, "clarity": 4},
-                               "weaknesses": ["표본이 작음"],
+            return json.dumps({"weaknesses": [{"text": "표본이 작음", "refs": ["P1", "E1"]},
+                                              {"text": "uncited", "refs": []}],
                                "next_queries": ["lightweight segmentation distillation",
                                                 "boundary refinement small objects"]})
         raise AssertionError("unexpected stage " + stage)
@@ -117,12 +119,22 @@ class ResearchAgentTests(unittest.TestCase):
         llm.transport = self.fake
         self.search_patch = patch.object(scholarly, "search_openalex", side_effect=self.fake.search)
         self.search_patch.start()
+        # Retry backoff is zero in tests. The runtime probe reports a fully GPU-loaded model (no warning).
+        self.backoff_patch = patch.object(research_agent, "_backoff_seconds", return_value=0)
+        self.backoff_patch.start()
+        self.probe_patch = patch.object(llm, "runtime_probe",
+                                        return_value=[{"name": "fake:latest", "size": 1000, "size_vram": 1000}])
+        self.probe_patch.start()
         llm.save_config(dict(LOCAL))
         self.seed_id = self.make_paper("Seed study", ABSTRACT, "10.1000/seed")
         self.add_profile(self.seed_id)
         self.project_id = self.client.post("/api/projects", json={"name": "연구"}, headers=self.h).json()["id"]
 
     def tearDown(self):
+        # Background workers must finish before the temporary data folder is removed.
+        research_agent._join_workers(10)
+        self.probe_patch.stop()
+        self.backoff_patch.stop()
         self.search_patch.stop()
         llm.transport = self.original_transport
         self.client.__exit__(None, None, None)
@@ -188,10 +200,26 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(create.status_code, 201, create.text)
         return create.json()["run"]["id"]
 
+    def wait_idle(self, run_id, timeout=20.0):
+        """Poll the run until its worker is no longer busy and return the detail."""
+        deadline = time.monotonic() + timeout
+        while True:
+            detail = self.client.get(f"/api/research-runs/{run_id}").json()
+            if not detail["run"]["busy"]:
+                return detail
+            if time.monotonic() > deadline:
+                self.fail("research run stayed busy")
+            time.sleep(0.02)
+
     def advance(self, run_id):
         response = self.client.post(f"/api/research-runs/{run_id}/advance", headers=self.h)
-        self.assertEqual(response.status_code, 200, response.text)
-        return response.json()
+        self.assertEqual(response.status_code, 202, response.text)
+        return self.wait_idle(run_id)
+
+    def step(self, run_id):
+        response = self.client.post(f"/api/research-runs/{run_id}/step", headers=self.h)
+        self.assertEqual(response.status_code, 202, response.text)
+        return self.wait_idle(run_id)
 
     # ---- chat
 
@@ -308,8 +336,15 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(state["methods"][0]["evidence"], ["E1"])
         self.assertEqual([c["statement"] for c in state["contributions"]],
                          ["작은 객체 경계 정확도 평가", "도시 외 장면으로 일반화 검증"])
-        self.assertIn("작은 객체 경계 정확도 평가", self.fake.search_calls)
-        self.assertEqual(state["critique"]["scores"], {"novelty": 4, "feasibility": 3, "evidence": 5, "clarity": 4})
+        # The closest-prior search uses the contribution's search_query, not the Korean statement (AC7).
+        self.assertIn("small object boundary accuracy evaluation", self.fake.search_calls)
+        self.assertNotIn("작은 객체 경계 정확도 평가", self.fake.search_calls)
+        critique = state["critique"]
+        self.assertNotIn("scores", critique)
+        self.assertEqual(set(critique), {"weaknesses", "next_queries", "checks", "dropped_uncited", "note"})
+        self.assertEqual([w["text"] for w in critique["weaknesses"]], ["표본이 작음"])
+        self.assertEqual(critique["weaknesses"][0]["refs"], ["P1", "E1"])
+        self.assertGreaterEqual(critique["dropped_uncited"], 1)
         self.assertEqual(state["critique"]["next_queries"],
                          ["lightweight segmentation distillation", "boundary refinement small objects"])
 
@@ -346,22 +381,23 @@ class ResearchAgentTests(unittest.TestCase):
         self.assertEqual(detail["run"]["status"], "budget_exhausted")
         self.assertEqual([s["stage"] for s in detail["steps"]], ["plan_queries", "search", "screen", "problems"])
         self.assertEqual(detail["run"]["llm_calls"], 2)
+        self.assertEqual(detail["run"]["stop_reason"], "calls")
         self.assertEqual(self.client.post(f"/api/research-runs/{run_id}/step", headers=self.h).status_code, 409)
 
     def test_failed_stage_is_recorded_and_retry_succeeds(self):
-        self.fake.fail_once = {"problems": 1}
+        # One invalid answer is retried once (AC4); the stage fails only when both attempts are invalid.
+        self.fake.fail_once = {"problems": 2}
         run_id = self.start_run()
         detail = self.advance(run_id)
         self.assertEqual(detail["run"]["status"], "failed_step")
         self.assertEqual(detail["run"]["stage"], "problems")
         self.assertEqual(detail["steps"][-1]["status"], "failed")
         self.assertTrue(detail["steps"][-1]["error"])
-        retry = self.client.post(f"/api/research-runs/{run_id}/step", headers=self.h)
-        self.assertEqual(retry.status_code, 200, retry.text)
-        self.assertEqual(retry.json()["steps"][-1]["status"], "done")
-        self.assertEqual(retry.json()["steps"][-1]["stage"], "problems")
-        self.assertEqual(retry.json()["run"]["stage"], "methods")
-        self.assertEqual(retry.json()["run"]["status"], "ready")
+        retry = self.step(run_id)
+        self.assertEqual(retry["steps"][-1]["status"], "done")
+        self.assertEqual(retry["steps"][-1]["stage"], "problems")
+        self.assertEqual(retry["run"]["stage"], "methods")
+        self.assertEqual(retry["run"]["status"], "ready")
 
     def test_external_run_requires_matching_hash(self):
         llm.save_config(dict(EXTERNAL))

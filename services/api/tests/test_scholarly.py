@@ -28,6 +28,17 @@ CROSSREF = {"message": {"DOI": "10.1234/ABC", "title": ["A Study"],
 
 
 class ScholarlyTests(unittest.TestCase):
+    def setUp(self):
+        # search_openalex caches successful results in memory; each test starts empty.
+        # The key lookup is pinned so the developer's real key or env var never affects a test.
+        scholarly.clear_openalex_cache()
+        self.key_patch = patch.object(scholarly, "openalex_key", return_value=None)
+        self.key_patch.start()
+
+    def tearDown(self):
+        self.key_patch.stop()
+        scholarly.clear_openalex_cache()
+
     def test_openalex_normalization_and_key_header(self):
         with patch.object(scholarly, "_get", return_value=json.dumps(OPENALEX).encode()) as fetch:
             result = scholarly.search_openalex("neural nets", 5, "secret")[0]
@@ -65,6 +76,7 @@ class ScholarlyTests(unittest.TestCase):
         with patch.object(scholarly, "_get", return_value=b'{"results": []}'):
             self.assertEqual(scholarly.search_openalex("query"), [])
         for body in (b"not json", b"{}", b'{"results": [null]}'):
+            scholarly.clear_openalex_cache()  # the empty result above is cached; each body needs a fresh fetch
             with self.subTest(body=body), patch.object(scholarly, "_get", return_value=body):
                 with self.assertRaises(scholarly.ScholarlyError) as error:
                     scholarly.search_openalex("query")

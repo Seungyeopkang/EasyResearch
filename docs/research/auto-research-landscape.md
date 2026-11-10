@@ -13,6 +13,7 @@
 | [B](raw/B-literature-gaps-ideas.md) | 논문 구조화 요약, 문헌 그래프, 갭 찾기, 아이디어 생성 도구·논문 |
 | [C](raw/C-agent-engineering.md) | 에이전트 공학: 워크플로 패턴, 서브에이전트, 스킬 규격, MCP, 루프·예산·검증, 프롬프트 주입 |
 | [D](raw/D-free-providers-graph.md) | 무료 LLM 제공자, OpenAlex·Semantic Scholar 그래프, Obsidian 그래프, JS force layout |
+| [E](raw/E-orchestration-architecture.md)–[I](raw/I-safety-hitl-mcp-skills.md) | 2차 조사: 구현한 설계(오케스트레이션, 서브에이전트, 루프, 안전, 추출)의 검증. 요약과 판정은 [오케스트레이션 검증](orchestration-review.md)에 있다. |
 
 ## 1. 자율 연구 시스템에서 배운 것 (A)
 

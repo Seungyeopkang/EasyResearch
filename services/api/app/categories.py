@@ -285,7 +285,7 @@ def _title_key(value) -> str:
 
 
 def _openalex_headers():
-    key = os.environ.get("OPENALEX_API_KEY")
+    key = scholarly.openalex_key()
     return {"Authorization": "Bearer " + key} if key else None
 
 
@@ -293,7 +293,7 @@ def _openalex_error(exc: scholarly.ScholarlyError):
     if exc.code == "not_found":
         raise HTTPException(404, "OpenAlex에서 이 DOI의 논문을 찾지 못했습니다.") from exc
     if exc.code == "rate_limited":
-        raise HTTPException(429, "OpenAlex 요청 한도에 도달했습니다. 잠시 후 다시 시도해 주세요.") from exc
+        raise HTTPException(429, scholarly.OPENALEX_RATE_LIMITED_MESSAGE) from exc
     raise HTTPException(502, "OpenAlex에 연결하지 못했거나 응답을 확인할 수 없습니다.") from exc
 
 
