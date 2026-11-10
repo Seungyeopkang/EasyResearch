@@ -176,6 +176,11 @@ class BackupInspectionTests(unittest.TestCase):
         db.write_bytes(entries["library.sqlite3"])
         connection = sqlite3.connect(str(db))
         try:
+            if version <= 6:
+                # Tables introduced in v7 must not appear in an older archive.
+                for table in ("research_steps", "research_runs", "chat_messages", "chat_threads",
+                              "research_gaps", "paper_links", "paper_profiles"):
+                    connection.execute("DROP TABLE IF EXISTS " + table)
             if version <= 5:
                 # Tables introduced in v6 must not appear in an older archive.
                 for table in ("paper_categories", "paper_topics", "paper_reading_state", "categories"):

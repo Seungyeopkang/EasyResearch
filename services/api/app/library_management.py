@@ -497,6 +497,8 @@ def _paper_plan(con, paper):
         ('paper_categories', 'paper_id=?', (pid,)),
         ('paper_topics', 'paper_id=?', (pid,)),
         ('paper_reading_state', 'paper_id=?', (pid,)),
+        ('paper_profiles', 'paper_id=?', (pid,)),
+        ('paper_links', 'source_paper_id=? OR target_paper_id=?', (pid, pid)),
     ]
     if jobs:
         specs += [
@@ -530,7 +532,14 @@ def _paper_plan(con, paper):
 def _project_plan(con, project):
     pid = project['id']
     ideas = _column(con, 'SELECT id FROM ideas WHERE project_id=?', (pid,))
+    threads = _column(con, 'SELECT id FROM chat_threads WHERE project_id=?', (pid,))
+    runs = _column(con, 'SELECT id FROM research_runs WHERE project_id=?', (pid,))
     specs = [
+        ('chat_messages', f'thread_id IN ({_in(threads)})', threads),
+        ('chat_threads', 'project_id=?', (pid,)),
+        ('research_steps', f'run_id IN ({_in(runs)})', runs),
+        ('research_runs', 'project_id=?', (pid,)),
+        ('research_gaps', 'project_id=?', (pid,)),
         ('idea_evidence', f'idea_id IN ({_in(ideas)})', ideas),
         ('ideas', 'project_id=?', (pid,)),
         ('experiments', 'project_id=?', (pid,)),

@@ -113,7 +113,29 @@ def _load_project(con, project_id):
         note = con.execute("SELECT note FROM project_paper_notes WHERE project_id=? AND paper_id=?", (project_id, item["id"])).fetchone()
         item["project_note"] = note["note"] if note else ""
         papers.append(item)
+    ids = {p["id"] for p in papers}
+    accepted = [dict(r) for r in con.execute(
+        "SELECT source_paper_id, target_paper_id, relation FROM paper_links WHERE status='accepted' ORDER BY created_at, id")]
+    for item in papers:
+        item["profile"] = _latest_profile(con, item["id"])
+        item["links"] = [l for l in accepted
+                         if item["id"] in (l["source_paper_id"], l["target_paper_id"])
+                         and l["source_paper_id"] != l["target_paper_id"]
+                         and l["source_paper_id"] in ids and l["target_paper_id"] in ids]
     return dict(project), papers
+
+
+def _latest_profile(con, paper_id):
+    """Return the newest profile_json dict for a paper (created_at, then rowid), or None."""
+    row = con.execute("SELECT profile_json FROM paper_profiles WHERE paper_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                      (paper_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row["profile_json"] or "{}")
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _respond(payload, media_type, filename=None):
@@ -207,9 +229,50 @@ def _deeplink(paper_id, project_id, page):
     return APP_BASE + paper_id + "?project=" + project_id + "&page=" + str(page)
 
 
-def _generated(project, paper):
+PROFILE_FACETS = (("problem", "문제"), ("method", "방법"), ("limitations", "한계"))
+
+
+def _one_line(text):
+    """Collapse whitespace so user or agent text cannot start new Markdown blocks."""
+    return _neutralize(" ".join(str(text or "").split()))
+
+
+def _profile_section(profile):
+    if profile is None:
+        return []
+    lines = ["## 논문 정리", ""]
+    summary = _one_line(profile.get("summary"))
+    lines.append("요약: " + (summary or "(없음)"))
+    facets = profile.get("facets") if isinstance(profile.get("facets"), dict) else {}
+    for key, label in PROFILE_FACETS:
+        items = facets.get(key) if isinstance(facets.get(key), list) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = _one_line(item.get("text"))
+            if not text:
+                continue
+            suffix = " (추정)" if item.get("origin") == "inferred" else ""
+            lines.append("- " + label + ": " + text + suffix)
+    return lines + [""]
+
+
+def _link_section(paper, keys):
+    lines = ["## 연결된 논문", ""]
+    if not paper["links"]:
+        lines.append("- 연결된 논문이 없습니다.")
+    for link in paper["links"]:
+        other = link["target_paper_id"] if link["source_paper_id"] == paper["id"] else link["source_paper_id"]
+        lines.append("- [[" + keys[other] + "]] · " + _one_line(link["relation"]))
+    return lines + [""]
+
+
+def _generated(project, paper, keys):
     pid, proj = paper["id"], project["id"]
-    lines = ["[EasyResearch에서 열기](" + _deeplink(pid, proj, 1) + ")", "", "## 프로젝트 메모", ""]
+    lines = ["[EasyResearch에서 열기](" + _deeplink(pid, proj, 1) + ")", ""]
+    lines += _profile_section(paper.get("profile"))
+    lines += _link_section(paper, keys)
+    lines += ["## 프로젝트 메모", ""]
     lines += _lines(paper["project_note"])
     lines += ["", "## 발췌", ""]
     for item in paper["evidence"]:
@@ -252,7 +315,7 @@ def _obsidian_notes(project, papers):
             "citekey": key,
             "filename": key + ".md",
             "frontmatter": _frontmatter(project, paper, key),
-            "generated": _generated(project, paper),
+            "generated": _generated(project, paper, keys),
             "title": paper["title"],
         })
     return notes

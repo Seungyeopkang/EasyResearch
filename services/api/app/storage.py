@@ -13,7 +13,7 @@ from typing import Iterator, Optional
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _server_lock = None
 
 
@@ -257,8 +257,53 @@ CREATE TABLE IF NOT EXISTS paper_topics (
 );
 """
 SCHEMA_V6 = SCHEMA_V5 + SCHEMA_V6_ADDITIONS
-SCHEMA = SCHEMA_V6
-SCHEMAS = {1: SCHEMA_V1, 2: SCHEMA_V2, 3: SCHEMA_V3, 4: SCHEMA_V4, 5: SCHEMA_V5, 6: SCHEMA_V6}
+# v7: research assistant records. AI output is always stored as a draft or
+# candidate with its origin, model and input hash; it never replaces evidence.
+SCHEMA_V7_ADDITIONS = """
+CREATE TABLE IF NOT EXISTS paper_profiles (
+ id TEXT PRIMARY KEY, paper_id TEXT NOT NULL REFERENCES papers(id), profile_json TEXT NOT NULL,
+ origin TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', model TEXT, input_hash TEXT,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_paper_profiles_paper ON paper_profiles(paper_id,created_at);
+CREATE TABLE IF NOT EXISTS paper_links (
+ id TEXT PRIMARY KEY, source_paper_id TEXT NOT NULL REFERENCES papers(id),
+ target_paper_id TEXT NOT NULL REFERENCES papers(id), relation TEXT NOT NULL, origin TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'suggested', note TEXT NOT NULL DEFAULT '', detail_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(source_paper_id,target_paper_id,relation)
+);
+CREATE TABLE IF NOT EXISTS research_gaps (
+ id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), title TEXT NOT NULL,
+ description TEXT NOT NULL DEFAULT '', gap_type TEXT NOT NULL, paper_ids_json TEXT NOT NULL DEFAULT '[]',
+ evidence_json TEXT NOT NULL DEFAULT '[]', origin TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate',
+ model TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS chat_threads (
+ id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), title TEXT NOT NULL, mode TEXT NOT NULL,
+ context_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS chat_messages (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+ role TEXT NOT NULL, content TEXT NOT NULL, meta_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS research_runs (
+ id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), topic TEXT NOT NULL, status TEXT NOT NULL,
+ config_json TEXT NOT NULL DEFAULT '{}', state_json TEXT NOT NULL DEFAULT '{}',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS research_steps (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES research_runs(id) ON DELETE CASCADE,
+ iteration INTEGER NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL DEFAULT '{}',
+ output_json TEXT NOT NULL DEFAULT '{}', error TEXT, model TEXT, prompt_hash TEXT,
+ started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT
+);
+"""
+SCHEMA_V7 = SCHEMA_V6 + SCHEMA_V7_ADDITIONS
+SCHEMA = SCHEMA_V7
+SCHEMAS = {1: SCHEMA_V1, 2: SCHEMA_V2, 3: SCHEMA_V3, 4: SCHEMA_V4, 5: SCHEMA_V5, 6: SCHEMA_V6, 7: SCHEMA_V7}
 
 # Editable default categories. Only the seeding helper below reads this list.
 DEFAULT_CATEGORIES = [
@@ -388,7 +433,12 @@ def _migrate_v5_v6(con: sqlite3.Connection) -> None:
     _seed_default_categories(con)
 
 
-MIGRATIONS = {0: _migrate_unversioned_v1, 1: _migrate_v1_v2, 2: _migrate_v2_v3, 3: _migrate_v3_v4, 4: _migrate_v4_v5, 5: _migrate_v5_v6}
+def _migrate_v6_v7(con: sqlite3.Connection) -> None:
+    # New tables only; no existing record is read or changed.
+    _execute_schema(con, SCHEMA_V7_ADDITIONS)
+
+
+MIGRATIONS = {0: _migrate_unversioned_v1, 1: _migrate_v1_v2, 2: _migrate_v2_v3, 3: _migrate_v3_v4, 4: _migrate_v4_v5, 5: _migrate_v5_v6, 6: _migrate_v6_v7}
 
 
 def _migrate_connection(con: sqlite3.Connection, *, allow_extra: bool = False) -> dict:

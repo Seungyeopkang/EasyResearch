@@ -63,6 +63,9 @@ class RestoreOpenWorkflowTests(unittest.TestCase):
                     legacy_db = root / 'synthetic-v3.sqlite3'
                     legacy_db.write_bytes(entries['library.sqlite3'])
                     with closing(sqlite3.connect(str(legacy_db))) as con:
+                        for table in ('research_steps', 'research_runs', 'chat_messages', 'chat_threads',
+                                      'research_gaps', 'paper_links', 'paper_profiles'):
+                            con.execute('DROP TABLE ' + table)
                         con.execute('DROP TABLE paper_categories')
                         con.execute('DROP TABLE paper_topics')
                         con.execute('DROP TABLE paper_reading_state')

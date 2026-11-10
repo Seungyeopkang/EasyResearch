@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations, reading_library, categories, search_import
+from . import analysis_engine, experiment_runner, jobs, scholarly, storage, library_management, evidence_records, integrations, reading_library, categories, search_import, ai_routes, knowledge, research_agent
 from .pdf_processing import locate_quote
 
 app = FastAPI(title="EasyResearch", version="0.1.0", description="로컬 연구 자료와 페이지 근거를 관리하는 API")
@@ -28,6 +28,9 @@ app.include_router(integrations.router)
 app.include_router(reading_library.router)
 app.include_router(categories.router)
 app.include_router(search_import.router)
+app.include_router(ai_routes.router)
+app.include_router(knowledge.router)
+app.include_router(research_agent.router)
 WEB = storage.ROOT / "apps" / "web"
 # Windows may register .mjs as text/plain, which browsers refuse as a module.
 mimetypes.add_type("text/javascript", ".mjs", strict=True)

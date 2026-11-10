@@ -180,6 +180,55 @@ class ExportIntegrationTests(unittest.TestCase):
         self.assertIn("@misc{" + KEY + ",", response.text)
         self.assertNotIn("@misc{er", response.text)
 
+    def test_obsidian_links_and_latest_profile_sections(self):
+        old_profile = {"summary": "옛 요약", "facets": {"method": [{"text": "옛 방법", "origin": "author_stated"}]}}
+        new_profile = {
+            "summary": "새 요약\n# 가짜 제목",
+            "facets": {
+                "problem": [{"text": "새 문제", "origin": "author_stated", "evidence": []}],
+                "limitations": [{"text": "추정 한계", "origin": "inferred", "evidence": []}],
+                "method": "not-a-list",
+            },
+        }
+        with storage.transaction() as con:
+            con.execute("INSERT INTO papers(id,title,authors,year,created_at) VALUES(?,?,?,?,?)",
+                        ("paper-c", "Transformer Study", json.dumps(["Ada Smith"]), 2020, "2026-01-03"))
+            con.execute("INSERT INTO project_papers(project_id,paper_id) VALUES(?,?)", (self.project, "paper-c"))
+            links = [
+                ("l1", "paper-a", "paper-c", "extends", "accepted"),
+                ("l2", "paper-c", "paper-a", "cites", "accepted"),
+                ("l3", "paper-a", "paper-b", "related", "accepted"),   # deleted paper: excluded
+                ("l4", "paper-c", "paper-a", "same_method", "suggested"),  # not accepted: excluded
+            ]
+            for lid, src, dst, relation, status in links:
+                con.execute("INSERT INTO paper_links(id,source_paper_id,target_paper_id,relation,origin,status) VALUES(?,?,?,?,?,?)",
+                            (lid, src, dst, relation, "manual", status))
+            con.execute("INSERT INTO paper_profiles(id,paper_id,profile_json,origin,status,created_at) VALUES(?,?,?,?,?,?)",
+                        ("pr1", "paper-a", json.dumps(old_profile, ensure_ascii=False), "rules", "draft", "2026-01-01"))
+            con.execute("INSERT INTO paper_profiles(id,paper_id,profile_json,origin,status,created_at) VALUES(?,?,?,?,?,?)",
+                        ("pr2", "paper-a", json.dumps(new_profile, ensure_ascii=False), "agent", "draft", "2026-01-05"))
+
+        notes = {n["paper_id"]: n for n in self.get("/obsidian-notes").json()["notes"]}
+        self.assertEqual(set(notes), {"paper-a", "paper-c"})
+
+        generated_a = notes["paper-a"]["generated"]
+        self.assertLess(generated_a.index("## 논문 정리"), generated_a.index("## 연결된 논문"))
+        self.assertLess(generated_a.index("## 연결된 논문"), generated_a.index("## 프로젝트 메모"))
+        self.assertIn("- [[smithTransformerStudy2020]] · extends", generated_a)
+        self.assertIn("- [[smithTransformerStudy2020]] · cites", generated_a)
+        self.assertNotIn("related", generated_a)
+        self.assertNotIn("same_method", generated_a)
+        self.assertIn("요약: 새 요약 # 가짜 제목", generated_a)
+        self.assertNotIn("\n# 가짜", generated_a)
+        self.assertIn("- 문제: 새 문제", generated_a)
+        self.assertIn("- 한계: 추정 한계 (추정)", generated_a)
+        self.assertNotIn("옛", generated_a)
+        self.assertEqual(generated_a.count(MARKER_END), 1)
+
+        generated_c = notes["paper-c"]["generated"]
+        self.assertIn("- [[" + KEY + "]] · extends", generated_c)
+        self.assertNotIn("## 논문 정리", generated_c)
+
     def test_missing_or_trashed_project_returns_404(self):
         for suffix in ("/export/csl-json", "/export/annotations", "/obsidian-notes", "/export/obsidian"):
             self.assertEqual(self.client.get("/api/projects/missing" + suffix).status_code, 404, suffix)

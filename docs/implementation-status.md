@@ -16,6 +16,12 @@
 
 - 2026-11-08: 프로젝트와 분리된 서재(스키마 v6, 논문별 읽기 상태), 연속 스크롤 뷰어, 브라우저 내장 번역(사용자 Chrome 157에서 확인), 분야 자동 분류(키워드 규칙과 OpenAlex 주제), 프로젝트 없는 검색과 공개 PDF 받기, 화면 디자인 개편을 추가했다. 세부 기록은 [ExecPlan 003](exec-plans/completed/003-reading-library-and-design.md)에 있다.
 
+- 2026-11-10: 연구 도우미 기초를 구현했다 (스키마 v7).
+  - 범위: 제공자 계층(Ollama 기본, OpenAI 호환 무료 등급, 미리보기 해시 승인), 논문 정리 프로필(규칙·AI·에이전트, 구절 대조), 논문 연결과 그래프, 갭 찾기, 연구 채팅, 단계형 자동 연구 루프, MCP 초안 쓰기 도구와 스킬 4종, Obsidian 위키링크.
+  - 실제로 확인한 것: 로컬 llama3-ko로 연결 확인, 채팅, 루프 1회 반복(OpenAlex 실제 검색 포함).
+  - 아직 안 된 것: llama3-ko로는 AI 프로필이 시간 초과나 빈 항목으로 끝나, 더 나은 모델로 다시 확인해야 한다. 외부 무료 제공자와 OpenAlex 인용 연결, MCP 도구의 실제 클라이언트 연결은 모의 테스트만 했다.
+  - 세부 기록은 [ExecPlan 004](exec-plans/active/004-research-assistant.md)에, 조사 근거는 [docs/research](research/auto-research-landscape.md)에 있다.
+
 ## 현재 동작
 
 - 단일 사용자 로컬 웹앱: 프로젝트 생성, PDF 등록·해시 기반 중복 처리, PDF 없는 검색 논문에 PDF 연결, 읽기 상태·마지막 앱 페이지 기록.
